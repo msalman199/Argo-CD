@@ -1,0 +1,413 @@
+ Introduction to Argo CD
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Understand the core concepts and architecture of Argo CD
+Install and configure Argo CD on a Kubernetes cluster
+Navigate and utilize the Argo CD web UI effectively
+Use the Argo CD CLI for basic operations
+Interact with Argo CD API endpoints
+Create and configure your first Argo CD project
+Deploy a sample application using GitOps principles
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Kubernetes concepts (pods, services, deployments)
+Familiarity with Git version control system
+Basic knowledge of YAML configuration files
+Understanding of containerization concepts
+Experience with Linux command line operations
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated environment. The provided Linux machine is bare metal with no pre-installed tools, so you will install all required components during the lab exercises.
+
+Task 1: Install Argo CD in Kubernetes
+Subtask 1.1: Install Docker
+First, we need to install Docker to support our containerized environment.
+
+# Update the package index
+sudo apt update
+
+# Install required packages
+sudo apt install -y apt-transport-https ca-certificates curl software-properties-common
+
+# Add Docker's official GPG key
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+# Add Docker repository
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Update package index again
+sudo apt update
+
+# Install Docker
+sudo apt install -y docker-ce docker-ce-cli containerd.io
+
+# Add current user to docker group
+sudo usermod -aG docker $USER
+
+# Start and enable Docker service
+sudo systemctl start docker
+sudo systemctl enable docker
+
+# Verify Docker installation
+docker --version
+Subtask 1.2: Install kubectl
+Install the Kubernetes command-line tool to interact with our cluster.
+
+# Download kubectl binary
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+# Make kubectl executable
+chmod +x kubectl
+
+# Move kubectl to system PATH
+sudo mv kubectl /usr/local/bin/
+
+# Verify kubectl installation
+kubectl version --client
+Subtask 1.3: Install kind (Kubernetes in Docker)
+We'll use kind to create a local Kubernetes cluster.
+
+# Download kind binary
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+
+# Make kind executable
+chmod +x ./kind
+
+# Move kind to system PATH
+sudo mv ./kind /usr/local/bin/kind
+
+# Verify kind installation
+kind version
+Subtask 1.4: Create Kubernetes Cluster
+Create a local Kubernetes cluster using kind.
+
+# Create a kind cluster
+kind create cluster --name argocd-lab
+
+# Verify cluster is running
+kubectl cluster-info --context kind-argocd-lab
+
+# Check nodes
+kubectl get nodes
+Subtask 1.5: Install Argo CD
+Now we'll install Argo CD in our Kubernetes cluster.
+
+# Create argocd namespace
+kubectl create namespace argocd
+
+# Install Argo CD
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Wait for all pods to be ready (this may take a few minutes)
+kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
+
+# Verify all Argo CD components are running
+kubectl get pods -n argocd
+Subtask 1.6: Expose Argo CD Server
+Make the Argo CD server accessible from outside the cluster.
+
+# Patch the argocd-server service to use NodePort
+kubectl patch svc argocd-server -n argocd -p '{"spec":{"type":"NodePort"}}'
+
+# Get the NodePort assigned
+kubectl get svc argocd-server -n argocd
+
+# Port forward to access the UI (run in background)
+kubectl port-forward svc/argocd-server -n argocd 8080:443 --address=0.0.0.0 &
+Task 2: Explore Argo CD UI, API, and CLI
+Subtask 2.1: Install Argo CD CLI
+Install the Argo CD command-line interface.
+
+# Download Argo CD CLI
+curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+
+# Make it executable
+chmod +x argocd-linux-amd64
+
+# Move to system PATH
+sudo mv argocd-linux-amd64 /usr/local/bin/argocd
+
+# Verify installation
+argocd version --client
+Subtask 2.2: Access Argo CD UI
+Get the initial admin password and access the web interface.
+
+# Get the initial admin password
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d && echo
+
+# Note: Save this password for UI login
+Important: The Argo CD UI is now accessible at https://localhost:8080. Use the following credentials:
+
+Username: admin
+Password: (the output from the command above)
+Subtask 2.3: Login via CLI
+Configure the CLI to connect to your Argo CD instance.
+
+# Login to Argo CD via CLI (use the password from previous step)
+argocd login localhost:8080 --username admin --password $(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d) --insecure
+
+# Verify login
+argocd account get-user-info
+Subtask 2.4: Explore CLI Commands
+Familiarize yourself with basic Argo CD CLI commands.
+
+# List available commands
+argocd --help
+
+# Get cluster information
+argocd cluster list
+
+# Get application information (should be empty initially)
+argocd app list
+
+# Get project information
+argocd proj list
+
+# Get repository information
+argocd repo list
+Subtask 2.5: Explore API Endpoints
+Test basic API functionality using curl.
+
+# Get API token for authentication
+API_TOKEN=$(argocd account generate-token --account admin)
+
+# Test API connectivity
+curl -k -H "Authorization: Bearer $API_TOKEN" https://localhost:8080/api/v1/clusters
+
+# Get application list via API
+curl -k -H "Authorization: Bearer $API_TOKEN" https://localhost:8080/api/v1/applications
+
+# Get project list via API
+curl -k -H "Authorization: Bearer $API_TOKEN" https://localhost:8080/api/v1/projects
+Task 3: Set up Initial Project in Argo CD
+Subtask 3.1: Create a Sample Git Repository
+We'll create a local Git repository with a sample application.
+
+# Create a directory for our sample application
+mkdir -p ~/argocd-lab/sample-app
+cd ~/argocd-lab/sample-app
+
+# Initialize Git repository
+git init
+
+# Create a simple Kubernetes deployment manifest
+cat > deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+  labels:
+    app: sample-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sample-app
+  template:
+    metadata:
+      labels:
+        app: sample-app
+    spec:
+      containers:
+      - name: sample-app
+        image: nginx:1.21
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app-service
+spec:
+  selector:
+    app: sample-app
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+  type: ClusterIP
+EOF
+
+# Create a simple ConfigMap
+cat > configmap.yaml << 'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sample-app-config
+data:
+  app.properties: |
+    app.name=sample-application
+    app.version=1.0.0
+    environment=development
+EOF
+
+# Add files to Git
+git add .
+git config user.email "student@alnafi.com"
+git config user.name "Lab Student"
+git commit -m "Initial commit: Add sample application manifests"
+
+# Get the repository path
+REPO_PATH=$(pwd)
+echo "Repository path: $REPO_PATH"
+Subtask 3.2: Create Argo CD Project
+Create a new project in Argo CD to organize our applications.
+
+# Create project using CLI
+argocd proj create lab-project \
+    --description "Lab project for learning Argo CD" \
+    --src "$REPO_PATH" \
+    --dest https://kubernetes.default.svc,default \
+    --allow-cluster-resource '*/*' \
+    --allow-namespaced-resource '*/*'
+
+# Verify project creation
+argocd proj list
+
+# Get detailed project information
+argocd proj get lab-project
+Subtask 3.3: Create Argo CD Application
+Create an application that will sync our sample manifests.
+
+# Create application using CLI
+argocd app create sample-app \
+    --repo "$REPO_PATH" \
+    --path . \
+    --dest-server https://kubernetes.default.svc \
+    --dest-namespace default \
+    --project lab-project \
+    --sync-policy automated \
+    --auto-prune \
+    --self-heal
+
+# Verify application creation
+argocd app list
+
+# Get detailed application information
+argocd app get sample-app
+Subtask 3.4: Sync and Deploy Application
+Synchronize the application to deploy it to the cluster.
+
+# Sync the application
+argocd app sync sample-app
+
+# Wait for sync to complete
+argocd app wait sample-app --timeout 300
+
+# Check application status
+argocd app get sample-app
+
+# Verify deployment in Kubernetes
+kubectl get deployments
+kubectl get services
+kubectl get configmaps
+kubectl get pods -l app=sample-app
+Subtask 3.5: Test GitOps Workflow
+Demonstrate the GitOps workflow by making changes to the repository.
+
+# Navigate to repository directory
+cd ~/argocd-lab/sample-app
+
+# Modify the deployment to change replica count
+sed -i 's/replicas: 2/replicas: 3/' deployment.yaml
+
+# Commit the change
+git add deployment.yaml
+git commit -m "Scale up to 3 replicas"
+
+# Refresh the application to detect changes
+argocd app refresh sample-app
+
+# Check if Argo CD detected the change
+argocd app get sample-app
+
+# Sync the changes
+argocd app sync sample-app
+
+# Verify the scaling occurred
+kubectl get deployments sample-app
+kubectl get pods -l app=sample-app
+Verification and Testing
+Verify Argo CD Installation
+# Check all Argo CD components are healthy
+kubectl get pods -n argocd
+
+# Verify services are running
+kubectl get svc -n argocd
+
+# Check Argo CD version
+argocd version
+Verify Application Deployment
+# Check application status in Argo CD
+argocd app get sample-app --output json | grep -E '"health"|"sync"'
+
+# Verify Kubernetes resources
+kubectl get all -l app=sample-app
+
+# Check application logs
+kubectl logs -l app=sample-app --tail=10
+Test UI Functionality
+Open your web browser and navigate to https://localhost:8080
+Login with username admin and the password retrieved earlier
+Verify you can see the sample-app application
+Click on the application to view its resource tree
+Explore different views: Tree, Network, List
+Check the application's sync status and health
+Troubleshooting Tips
+Common Issues and Solutions
+Issue: Pods stuck in Pending state
+
+# Check node resources
+kubectl describe nodes
+
+# Check pod events
+kubectl describe pod <pod-name>
+Issue: Argo CD UI not accessible
+
+# Check if port-forward is running
+ps aux | grep port-forward
+
+# Restart port-forward if needed
+pkill -f "port-forward"
+kubectl port-forward svc/argocd-server -n argocd 8080:443 --address=0.0.0.0 &
+Issue: Application sync fails
+
+# Check application events
+argocd app get sample-app --output yaml
+
+# Check Kubernetes events
+kubectl get events --sort-by=.metadata.creationTimestamp
+Issue: CLI authentication problems
+
+# Re-login to Argo CD
+argocd logout
+argocd login localhost:8080 --username admin --insecure
+Key Concepts Learned
+Argo CD Architecture Components
+API Server: Exposes the API consumed by Web UI, CLI, and CI/CD systems
+Repository Server: Internal service that maintains a local cache of Git repositories
+Application Controller: Kubernetes controller that continuously monitors running applications
+Redis: Used for caching and as a message broker
+Dex: Identity service for authentication (optional)
+GitOps Principles
+Declarative: System state is described declaratively
+Versioned: Configuration is stored in Git with full version history
+Automated: Changes are automatically applied to the system
+Monitored: System continuously monitors and corrects drift
+Argo CD Key Features
+Application Management: Deploy and manage applications across multiple environments
+Git Integration: Sync applications from Git repositories automatically
+Multi-tenancy: Support for multiple projects and RBAC
+Health Monitoring: Continuous monitoring of application health
+Rollback Capabilities: Easy rollback to previous application states
+Conclusion
+In this lab, you have successfully:
+
+Installed Argo CD on a Kubernetes cluster using industry-standard practices
+Explored multiple interfaces including the web UI, CLI, and REST API
+Created your first project and application using GitOps principles
+Demonstrated the GitOps workflow by making changes and observing automatic synchronization
+Learned core concepts of continuous deployment and declarative configuration management
+This foundation prepares you for more advanced Argo CD topics such as multi-environment deployments, advanced sync policies, custom health checks, and integration with CI/CD pipelines. The GitOps approach you've learned here represents a modern, scalable way to manage application deployments that improves reliability, security, and operational efficiency.
+
