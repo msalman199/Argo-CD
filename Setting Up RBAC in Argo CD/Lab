@@ -1,0 +1,424 @@
+Implementing Production-Grade RBAC in Argo CD
+Objectives
+Design and enforce a multi-tier RBAC policy in Argo CD that isolates permissions across developer, DevOps, and admin roles using the Casbin policy engine embedded in Argo CD
+Validate access boundaries by testing each role's permitted and denied operations against scoped AppProjects and Applications
+Diagnose and resolve RBAC misconfiguration using Argo CD's policy evaluation API and server-side audit logs
+Prerequisites
+Comfort with Linux command-line operations including file editing, process management, and reading structured log output
+Conceptual understanding of Kubernetes RBAC (Roles, RoleBindings, ServiceAccounts) and how namespace isolation works
+Familiarity with GitOps principles and the Argo CD application model (Applications, AppProjects, sync policies)
+Lab Environment
+You will work on a dedicated AWS EC2 Ubuntu instance provided by Al Nafi. The instance has a base Ubuntu installation; you will install all required tools in Task 1.
+
+Task 1: Provision the Environment
+Step 1.1: Install Container Runtime, Kubernetes Tooling, and Argo CD CLI
+Your instance has no tooling pre-installed. You must bring up a single-node Kubernetes cluster using Minikube, then install the Argo CD CLI. The cluster must be reachable via kubectl before you proceed to Task 2.
+
+Install Docker, kubectl, Minikube, and the Argo CD CLI. Verify each tool reports a valid version before continuing. The cluster must start with at least 4 GB of memory and 2 CPUs allocated to Minikube so that Argo CD's control-plane components have sufficient headroom.
+
+# 1. System update
+sudo apt-get update -y && sudo apt-get upgrade -y
+sudo apt-get install -y curl wget git apt-transport-https ca-certificates gnupg lsb-release
+
+# 2. Docker
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker $USER
+newgrp docker
+docker version
+Official Docker install guide (use this if the URL above changes): https://docs.docker.com/engine/install/ubuntu/
+
+Troubleshoot this step:
+
+Error seen: permission denied while trying to connect to the Docker daemon socket after running docker version.
+Recovery: Run groups to confirm docker appears; if not, log out and back in, or run newgrp docker again.
+Reference: https://docs.docker.com/engine/install/linux-postinstall/
+# 3. kubectl
+KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o kubectl
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+rm kubectl
+kubectl version --client
+Official kubectl install guide: https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/
+
+Troubleshoot this step:
+
+Error seen: curl: (22) The requested URL returned error: 404 when fetching the kubectl binary.
+Recovery: Run curl -fsSL https://dl.k8s.io/release/stable.txt to confirm the version string is valid (e.g. v1.30.2), then retry the download with that version substituted explicitly.
+Reference: https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/
+# 4. Minikube
+curl -fsSL https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64 -o minikube
+sudo install -o root -g root -m 0755 minikube /usr/local/bin/minikube
+rm minikube
+minikube version
+Official Minikube install guide: https://minikube.sigs.k8s.io/docs/start/
+
+Troubleshoot this step:
+
+Error seen: Exiting due to PROVIDER_DOCKER_NOT_RUNNING: Docker Desktop is not running or similar Docker socket error.
+Recovery: Run sudo systemctl start docker && sudo systemctl enable docker, then confirm with docker info.
+Reference: https://minikube.sigs.k8s.io/docs/drivers/docker/
+# 5. Start cluster
+minikube start --driver=docker --memory=4096 --cpus=2
+kubectl cluster-info
+kubectl get nodes
+Troubleshoot this step:
+
+Error seen: Error response from daemon: cannot stop container or minikube start hangs beyond 5 minutes.
+Recovery: Run minikube delete to wipe state, then minikube start --driver=docker --memory=4096 --cpus=2 again.
+Reference: https://minikube.sigs.k8s.io/docs/handbook/troubleshooting/
+Step 1.2: Deploy Argo CD and Verify Control-Plane Health
+Deploy Argo CD into a dedicated namespace and confirm every control-plane pod reaches Running status before proceeding. Then install the Argo CD CLI and authenticate as the bootstrap admin user.
+
+# 1. Deploy Argo CD
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+Official Argo CD install guide: https://argo-cd.readthedocs.io/en/stable/getting_started/
+
+# 2. Wait for control plane
+kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
+kubectl wait --for=condition=available --timeout=300s deployment/argocd-repo-server -n argocd
+kubectl wait --for=condition=available --timeout=300s deployment/argocd-application-controller -n argocd
+kubectl get pods -n argocd
+Troubleshoot this step:
+
+Error seen: error: timed out waiting for the condition on deployments/argocd-server after 300 seconds.
+Recovery: Run kubectl describe pod -n argocd -l app.kubernetes.io/name=argocd-server and look for ImagePullBackOff or resource pressure; increase Minikube memory with minikube stop && minikube start --memory=6144 --cpus=2 if resources are the cause.
+Reference: https://argo-cd.readthedocs.io/en/stable/operator-manual/installation/
+# 3. Argo CD CLI
+ARGOCD_VERSION=$(curl -fsSL https://api.github.com/repos/argoproj/argo-cd/releases/latest | grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)".*/\1/')
+curl -fsSL "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64" -o argocd
+sudo install -m 0755 argocd /usr/local/bin/argocd
+rm argocd
+argocd version --client
+Official Argo CD CLI install guide: https://argo-cd.readthedocs.io/en/stable/cli_installation/
+
+# 4. Expose and authenticate
+kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+sleep 5
+
+ARGOCD_INITIAL_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 --decode)
+
+argocd login localhost:8080 \
+  --username admin \
+  --password "${ARGOCD_INITIAL_PASSWORD}" \
+  --insecure
+
+argocd account list
+Confirmation: argocd account list must return at least one row showing admin with Enabled: true.
+
+Task 2: Design and Apply a Multi-Tier RBAC Policy
+Step 2.1: Define Local Users, AppProjects, and the RBAC Policy Matrix
+Argo CD RBAC is governed by two ConfigMaps: argocd-cm (user accounts and server settings) and argocd-rbac-cm (Casbin policy rules). Casbin is the policy engine Argo CD uses; its rules follow the pattern p, subject, resource, action, object, effect.
+
+Your requirement is to implement the following access matrix without deviation:
+
+User	Role	Permitted	Denied
+alice	developer	get/sync any application, read logs	create/delete applications, manage repos
+bob	devops	full application lifecycle, manage repositories, read clusters/projects	manage clusters, manage projects
+charlie	org-admin	all resources and actions	nothing
+You must also create two AppProjects â team-alpha and team-beta â each scoped to its own namespace (alpha-ns and beta-ns). Alice must be additionally constrained so that her sync permission applies only to team-alpha applications, not team-beta.
+
+# 1. Create target namespaces
+kubectl create namespace alpha-ns
+kubectl create namespace beta-ns
+# 2. Register local users in argocd-cm
+# The accounts.USERNAME key enables a local login account.
+# Do not overwrite existing keys in argocd-cm â patch instead.
+kubectl patch configmap argocd-cm -n argocd --type merge -p '{
+  "data": {
+    "accounts.alice": "login",
+    "accounts.bob": "login",
+    "accounts.charlie": "login"
+  }
+}'
+
+kubectl get configmap argocd-cm -n argocd -o jsonpath='{.data}' | tr ',' '\n'
+# 3. Set passwords for each local user
+ARGOCD_INITIAL_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 --decode)
+
+argocd account update-password \
+  --account alice \
+  --new-password "AlicePass#2024" \
+  --current-password "${ARGOCD_INITIAL_PASSWORD}"
+
+argocd account update-password \
+  --account bob \
+  --new-password "BobPass#2024" \
+  --current-password "${ARGOCD_INITIAL_PASSWORD}"
+
+argocd account update-password \
+  --account charlie \
+  --new-password "CharliePass#2024" \
+  --current-password "${ARGOCD_INITIAL_PASSWORD}"
+
+argocd account list
+# 4. Apply AppProjects
+kubectl apply -f - <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: team-alpha
+  namespace: argocd
+spec:
+  description: "Project scoped to the alpha team namespace"
+  sourceRepos:
+    - "https://github.com/argoproj/argocd-example-apps.git"
+  destinations:
+    - namespace: alpha-ns
+      server: https://kubernetes.default.svc
+  namespaceResourceWhitelist:
+    - group: apps
+      kind: Deployment
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ConfigMap
+EOF
+
+kubectl apply -f - <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: team-beta
+  namespace: argocd
+spec:
+  description: "Project scoped to the beta team namespace"
+  sourceRepos:
+    - "https://github.com/argoproj/argocd-example-apps.git"
+  destinations:
+    - namespace: beta-ns
+      server: https://kubernetes.default.svc
+  namespaceResourceWhitelist:
+    - group: apps
+      kind: Deployment
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ConfigMap
+EOF
+
+argocd proj list
+# 5. Apply the RBAC policy
+# policy.default sets the fallback role for any authenticated user not matched by a rule.
+# The object field for applications uses the format: PROJECT/APP-NAME
+kubectl apply -f - <<'EOF'
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-rbac-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-rbac-cm
+    app.kubernetes.io/part-of: argocd
+data:
+  policy.default: role:readonly
+  policy.csv: |
+    # --- role:readonly (built-in baseline) ---
+    p, role:readonly, applications, get, */*, allow
+    p, role:readonly, projects,     get, *,   allow
+
+    # --- role:developer ---
+    p, role:developer, applications, get,      */*, allow
+    p, role:developer, applications, sync,     team-alpha/*, allow
+    p, role:developer, logs,         get,      */*, allow
+
+    # --- role:devops ---
+    p, role:devops, applications,  get,    */*, allow
+    p, role:devops, applications,  create, */*, allow
+    p, role:devops, applications,  update, */*, allow
+    p, role:devops, applications,  delete, */*, allow
+    p, role:devops, applications,  sync,   */*, allow
+    p, role:devops, repositories,  get,    *,   allow
+    p, role:devops, repositories,  create, *,   allow
+    p, role:devops, repositories,  update, *,   allow
+    p, role:devops, repositories,  delete, *,   allow
+    p, role:devops, clusters,      get,    *,   allow
+    p, role:devops, projects,      get,    *,   allow
+    p, role:devops, logs,          get,    */*, allow
+
+    # --- role:org-admin ---
+    p, role:org-admin, *, *, *, allow
+
+    # --- user-to-role bindings ---
+    g, alice,   role:developer
+    g, bob,     role:devops
+    g, charlie, role:org-admin
+EOF
+
+kubectl get configmap argocd-rbac-cm -n argocd -o jsonpath='{.data.policy\.csv}'
+# 6. Restart argocd-server so it reloads both ConfigMaps
+kubectl rollout restart deployment/argocd-server -n argocd
+kubectl wait --for=condition=available --timeout=120s deployment/argocd-server -n argocd
+Confirmation: kubectl get configmap argocd-rbac-cm -n argocd -o jsonpath='{.data.policy\.csv}' must print all policy lines without truncation.
+
+Step 2.2: Deploy Scoped Test Applications
+Deploy one Application into each AppProject so that permission boundaries can be exercised in Task 3. Both Applications must reference the public argocd-example-apps repository and target their respective namespaces.
+
+# Application in team-alpha
+kubectl apply -f - <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: guestbook-alpha
+  namespace: argocd
+spec:
+  project: team-alpha
+  source:
+    repoURL: https://github.com/argoproj/argocd-example-apps.git
+    targetRevision: HEAD
+    path: guestbook
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: alpha-ns
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: false
+EOF
+
+# Application in team-beta
+kubectl apply -f - <<'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: guestbook-beta
+  namespace: argocd
+spec:
+  project: team-beta
+  source:
+    repoURL: https://github.com/argoproj/argocd-example-apps.git
+    targetRevision: HEAD
+    path: guestbook
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: beta-ns
+  syncPolicy:
+    automated:
+      prune: false
+      selfHeal: false
+EOF
+
+argocd app list
+Confirmation: argocd app list (as admin) must show both guestbook-alpha and guestbook-beta with a project assignment visible in the PROJECT column.
+
+Task 3: Validate Access Boundaries and Audit Policy Decisions
+Step 3.1: Execute Boundary Tests for Each Role
+Your requirement is to programmatically verify that each user can perform exactly the operations the policy matrix in Step 2.1 permits, and is denied all others. Use argocd account can-i for pre-flight checks and direct CLI operations for live enforcement tests.
+
+The interface contract below defines the shape of a validation harness you must implement as a shell script named rbac-validator.sh. You own the implementation; the contract defines what the script must accept and emit.
+
+# Interface contract â implement this in rbac-validator.sh
+#
+# rbac_test_case()
+#   Arguments:
+#     $1  username        (string)  â local Argo CD account name
+#     $2  password        (string)  â account password
+#     $3  resource        (string)  â Argo CD resource type (e.g. "applications")
+#     $4  action          (string)  â action verb (e.g. "sync", "create", "delete")
+#     $5  object          (string)  â resource object path (e.g. "team-alpha/guestbook-alpha")
+#     $6  expected_result (string)  â "allow" or "deny"
+#   Returns:
+#     Prints one line: "PASS" or "FAIL: <reason>"
+#     Exit code 0 on PASS, 1 on FAIL
+#
+# rbac_run_suite()
+#   Arguments: none
+#   Behaviour: calls rbac_test_case for every row in the matrix below,
+#              accumulates results, prints a summary table, exits non-zero
+#              if any case fails
+#
+# Required test matrix (implement all rows):
+#   alice  / AlicePass#2024  / applications / get    / team-alpha/guestbook-alpha  / allow
+#   alice  / AlicePass#2024  / applications / sync   / team-alpha/guestbook-alpha  / allow
+#   alice  / AlicePass#2024  / applications / sync   / team-beta/guestbook-beta    / deny
+#   alice  / AlicePass#2024  / applications / create / team-alpha/*                / deny
+#   alice  / AlicePass#2024  / applications / delete / team-alpha/*                / deny
+#   bob    / BobPass#2024    / applications / create / team-alpha/*                / allow
+#   bob    / BobPass#2024    / applications / delete / team-alpha/*                / allow
+#   bob    / BobPass#2024    / repositories / create / *                           / allow
+#   bob    / BobPass#2024    / projects     / create / *                           / deny
+#   bob    / BobPass#2024    / clusters     / delete / *                           / deny
+#   charlie/ CharliePass#2024/ projects     / create / *                           / allow
+#   charlie/ CharliePass#2024/ clusters     / delete / *                           / allow
+After implementing the script, run it and confirm all rows report PASS:
+
+chmod +x rbac-validator.sh
+./rbac-validator.sh
+Confirmation: The summary table must show zero FAIL rows. Any FAIL indicates a policy rule gap that must be corrected in argocd-rbac-cm before proceeding.
+
+Step 3.2: Audit Policy Decisions via Server Logs and the can-i API
+Enable debug-level RBAC logging on the Argo CD server, trigger a denied action as alice, and capture the resulting log entry. Then use the argocd account can-i API to confirm the policy engine's decision matches the log evidence.
+
+# 1. Enable RBAC enforcement logging
+kubectl patch configmap argocd-cmd-params-cm -n argocd --type merge -p '{
+  "data": {
+    "server.log.level": "debug",
+    "server.log.format": "json"
+  }
+}'
+
+kubectl rollout restart deployment/argocd-server -n argocd
+kubectl wait --for=condition=available --timeout=120s deployment/argocd-server -n argocd
+# 2. Trigger a denied action as alice (attempt to sync team-beta app)
+argocd login localhost:8080 \
+  --username alice \
+  --password "AlicePass#2024" \
+  --insecure
+
+argocd app sync guestbook-beta || true
+# 3. Capture the RBAC enforcement log entry
+# The log line will contain "enforcer" and the decision "false" for a deny.
+kubectl logs -n argocd deployment/argocd-server --since=2m \
+  | grep -i "enforc" \
+  | tail -20
+# 4. Confirm via the can-i API (re-authenticate as admin first)
+ARGOCD_INITIAL_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 --decode)
+
+argocd login localhost:8080 \
+  --username admin \
+  --password "${ARGOCD_INITIAL_PASSWORD}" \
+  --insecure
+
+# Each command prints "yes" (allow) or "no" (deny)
+argocd account can-i sync   applications --as alice   "team-alpha/guestbook-alpha"
+argocd account can-i sync   applications --as alice   "team-beta/guestbook-beta"
+argocd account can-i create applications --as alice   "team-alpha/*"
+argocd account can-i create applications --as bob     "team-alpha/*"
+argocd account can-i delete projects     --as bob     "*"
+argocd account can-i delete projects     --as charlie "*"
+Confirmation: The can-i output must match the expected_result column in the test matrix exactly. Any mismatch means the policy in argocd-rbac-cm does not match your intent and must be corrected.
+
+Code Contracts
+The following interface defines the shape of the validation harness from Step 3.1. Students own all implementation decisions.
+
+# rbac-validator.sh â required function signatures
+#
+# rbac_test_case()
+#   in:  username, password, resource, action, object, expected_result
+#   out: "PASS" | "FAIL: <reason>" on stdout; exit 0 | 1
+#
+# rbac_run_suite()
+#   in:  (none)
+#   out: per-row result lines + summary table on stdout
+#        exits non-zero if any case fails
+#
+# login_as()
+#   in:  username, password
+#   out: sets active argocd session; exits non-zero on auth failure
+#
+# restore_admin_session()
+#   in:  (none)
+#   out: re-authenticates as admin using the initial secret
+Expected Outcomes
+Every row in the RBAC test matrix reports PASS, confirming that role boundaries are enforced at the Argo CD policy engine level with no privilege bleed between roles.
+The Argo CD server debug logs contain a structured JSON entry for each denied action, and argocd account can-i decisions are consistent with those log entries for all three users.
+Troubleshooting
+If argocd account can-i returns yes for an action you expected to be denied, what sequence of policy rules â including the policy.default fallback and any group inheritance chains â could produce an unintended allow decision, and how would you isolate which specific rule is responsible?
+
+If the Argo CD server logs show no RBAC enforcement entries after triggering a denied action, what configuration gap in argocd-cmd-params-cm or the server restart sequence could explain the absence, and what would you check first to confirm the new log level is actually active?
+
+Conclusion
+This lab demonstrated how Argo CD's Casbin-based RBAC engine enforces access boundaries across users, AppProjects, and application objects through a declarative policy ConfigMap. You built a multi-tier role hierarchy, scoped permissions to individual projects, and validated every boundary programmatically using both the can-i API and server-side audit logs. These patterns transfer directly to production environments where separation of duties between development, operations, and administrative personas is a compliance requirement.
