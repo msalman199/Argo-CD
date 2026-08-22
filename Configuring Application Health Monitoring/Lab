@@ -1,0 +1,950 @@
+Configuring Application Health Monitoring
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Understand how Argo CD monitors application health and detects configuration drift
+Configure and enable application health monitoring in Argo CD
+Test and identify discrepancies between live cluster state and Git repository state
+Analyze health status indicators and troubleshoot application deployment issues
+Implement best practices for maintaining application synchronization
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Kubernetes concepts (pods, services, deployments)
+Familiarity with Git version control system
+Knowledge of YAML configuration files
+Basic Linux command line experience
+Understanding of containerized applications
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated environment. The provided Linux machine is bare metal with no pre-installed tools, so you will install all required tools during the lab exercises.
+
+Task 1: Setting Up the Lab Environment
+Subtask 1.1: Install Required Tools
+First, we need to install Docker, kubectl, kind (Kubernetes in Docker), and Argo CD CLI on our Linux machine.
+
+# Update system packages
+sudo apt update && sudo apt upgrade -y
+
+# Install Docker
+sudo apt install -y docker.io
+sudo systemctl start docker
+sudo systemctl enable docker
+sudo usermod -aG docker $USER
+
+# Install kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+# Install kind
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+chmod +x ./kind
+sudo mv ./kind /usr/local/bin/kind
+
+# Install Argo CD CLI
+curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+rm argocd-linux-amd64
+
+# Install Git
+sudo apt install -y git
+
+# Logout and login again to apply Docker group changes
+newgrp docker
+Subtask 1.2: Create Kubernetes Cluster
+Create a local Kubernetes cluster using kind:
+
+# Create kind cluster configuration
+cat <<EOF > kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"
+  extraPortMappings:
+  - containerPort: 80
+    hostPort: 8080
+    protocol: TCP
+  - containerPort: 443
+    hostPort: 8443
+    protocol: TCP
+EOF
+
+# Create the cluster
+kind create cluster --config=kind-config.yaml --name=argocd-lab
+
+# Verify cluster is running
+kubectl cluster-info --context kind-argocd-lab
+kubectl get nodes
+Subtask 1.3: Install Argo CD
+Install Argo CD in the Kubernetes cluster:
+
+# Create argocd namespace
+kubectl create namespace argocd
+
+# Install Argo CD
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Wait for Argo CD pods to be ready
+kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
+
+# Verify installation
+kubectl get pods -n argocd
+Subtask 1.4: Access Argo CD UI
+Set up access to the Argo CD web interface:
+
+# Port forward to access Argo CD UI
+kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+
+# Get initial admin password
+ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+echo "Argo CD Admin Password: $ARGOCD_PASSWORD"
+
+# Login via CLI
+argocd login localhost:8080 --username admin --password $ARGOCD_PASSWORD --insecure
+
+echo "Argo CD is accessible at: https://localhost:8080"
+echo "Username: admin"
+echo "Password: $ARGOCD_PASSWORD"
+Task 2: Enable Application Health Monitoring
+Subtask 2.1: Create Sample Application Repository
+Create a local Git repository with sample Kubernetes manifests:
+
+# Create project directory
+mkdir -p ~/argocd-health-lab
+cd ~/argocd-health-lab
+
+# Initialize Git repository
+git init
+git config user.name "Lab User"
+git config user.email "lab@example.com"
+
+# Create application manifests directory
+mkdir -p k8s-manifests
+
+# Create a sample deployment
+cat <<EOF > k8s-manifests/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+  namespace: default
+  labels:
+    app: sample-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sample-app
+  template:
+    metadata:
+      labels:
+        app: sample-app
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.21
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "250m"
+          limits:
+            memory: "128Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+EOF
+
+# Create a service
+cat <<EOF > k8s-manifests/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app-service
+  namespace: default
+  labels:
+    app: sample-app
+spec:
+  selector:
+    app: sample-app
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+  type: ClusterIP
+EOF
+
+# Create a ConfigMap
+cat <<EOF > k8s-manifests/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sample-app-config
+  namespace: default
+data:
+  app.properties: |
+    environment=production
+    debug=false
+    log.level=info
+  nginx.conf: |
+    server {
+        listen 80;
+        location / {
+            return 200 'Hello from Sample App!';
+            add_header Content-Type text/plain;
+        }
+    }
+EOF
+
+# Commit initial version
+git add .
+git commit -m "Initial application manifests"
+Subtask 2.2: Configure Argo CD Application with Health Monitoring
+Create an Argo CD application with health monitoring enabled:
+
+# Create application configuration
+cat <<EOF > argocd-application.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sample-app-health-monitor
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: file:///home/$USER/argocd-health-lab
+    targetRevision: HEAD
+    path: k8s-manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: false
+    syncOptions:
+    - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+  # Health monitoring configuration
+  ignoreDifferences:
+  - group: apps
+    kind: Deployment
+    jsonPointers:
+    - /spec/replicas
+  revisionHistoryLimit: 10
+EOF
+
+# Apply the application
+kubectl apply -f argocd-application.yaml
+
+# Verify application creation
+argocd app list
+Subtask 2.3: Configure Health Check Settings
+Configure detailed health monitoring settings:
+
+# Create custom health check configuration
+cat <<EOF > health-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-cm
+    app.kubernetes.io/part-of: argocd
+data:
+  # Enable health assessment for custom resources
+  resource.customizations.health.argoproj.io_Application: |
+    hs = {}
+    hs.status = "Progressing"
+    hs.message = ""
+    if obj.status ~= nil then
+      if obj.status.health ~= nil then
+        hs.status = obj.status.health.status
+        if obj.status.health.message ~= nil then
+          hs.message = obj.status.health.message
+        end
+      end
+    end
+    return hs
+  
+  # Configure application health check timeout
+  timeout.hard.reconciliation: 0
+  timeout.reconciliation: 180s
+  
+  # Enable detailed health status
+  application.instanceLabelKey: argocd.argoproj.io/instance
+  
+  # Configure sync options
+  application.resourceTrackingMethod: annotation
+EOF
+
+# Apply health configuration
+kubectl apply -f health-config.yaml
+
+# Restart Argo CD server to apply changes
+kubectl rollout restart deployment/argocd-server -n argocd
+kubectl rollout restart deployment/argocd-application-controller -n argocd
+
+# Wait for restart to complete
+kubectl rollout status deployment/argocd-server -n argocd
+kubectl rollout status deployment/argocd-application-controller -n argocd
+Task 3: Test for Discrepancies Between Live State and Git State
+Subtask 3.1: Sync Application and Monitor Initial Health
+Sync the application and observe its health status:
+
+# Sync the application
+argocd app sync sample-app-health-monitor
+
+# Wait for sync to complete
+argocd app wait sample-app-health-monitor --timeout 300
+
+# Check application status
+argocd app get sample-app-health-monitor
+
+# Verify resources are deployed
+kubectl get all -l app=sample-app
+kubectl get configmap sample-app-config
+Subtask 3.2: Create Configuration Drift
+Manually modify the live cluster state to create drift:
+
+# Scale deployment directly in cluster (creating drift)
+kubectl scale deployment sample-app --replicas=4
+
+# Modify ConfigMap directly in cluster
+kubectl patch configmap sample-app-config --patch='{"data":{"app.properties":"environment=development\ndebug=true\nlog.level=debug"}}'
+
+# Add a label to the service
+kubectl label service sample-app-service environment=modified
+
+# Check current state
+kubectl get deployment sample-app -o yaml | grep replicas:
+kubectl get configmap sample-app-config -o yaml
+Subtask 3.3: Monitor Health Status and Detect Drift
+Check how Argo CD detects and reports the configuration drift:
+
+# Check application health status
+argocd app get sample-app-health-monitor
+
+# Get detailed diff information
+argocd app diff sample-app-health-monitor
+
+# Check sync status
+argocd app get sample-app-health-monitor --output json | jq '.status.sync'
+
+# View application events
+kubectl describe application sample-app-health-monitor -n argocd
+Subtask 3.4: Analyze Health Monitoring Results
+Create a script to continuously monitor health status:
+
+# Create health monitoring script
+cat <<EOF > monitor-health.sh
+#!/bin/bash
+
+echo "=== Argo CD Application Health Monitor ==="
+echo "Monitoring application: sample-app-health-monitor"
+echo "Press Ctrl+C to stop monitoring"
+echo
+
+while true; do
+    echo "--- \$(date) ---"
+    
+    # Get application status
+    STATUS=\$(argocd app get sample-app-health-monitor --output json)
+    
+    # Extract key information
+    HEALTH=\$(echo "\$STATUS" | jq -r '.status.health.status // "Unknown"')
+    SYNC=\$(echo "\$STATUS" | jq -r '.status.sync.status // "Unknown"')
+    REVISION=\$(echo "\$STATUS" | jq -r '.status.sync.revision // "Unknown"')
+    
+    echo "Health Status: \$HEALTH"
+    echo "Sync Status: \$SYNC"
+    echo "Git Revision: \$REVISION"
+    
+    # Check for out of sync resources
+    OUT_OF_SYNC=\$(echo "\$STATUS" | jq -r '.status.resources[] | select(.status != "Synced") | .name' 2>/dev/null)
+    if [ ! -z "\$OUT_OF_SYNC" ]; then
+        echo "Out of Sync Resources:"
+        echo "\$OUT_OF_SYNC"
+    fi
+    
+    echo "------------------------"
+    sleep 10
+done
+EOF
+
+chmod +x monitor-health.sh
+
+# Run the monitoring script in background
+./monitor-health.sh &
+MONITOR_PID=$!
+
+# Let it run for a minute to observe drift detection
+sleep 60
+
+# Stop monitoring
+kill $MONITOR_PID
+Subtask 3.5: Test Self-Healing Capabilities
+Enable self-healing and observe automatic drift correction:
+
+# Enable self-healing in the application
+cat <<EOF > argocd-application-selfheal.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sample-app-health-monitor
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: file:///home/$USER/argocd-health-lab
+    targetRevision: HEAD
+    path: k8s-manifests
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true  # Enable self-healing
+    syncOptions:
+    - CreateNamespace=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+  ignoreDifferences:
+  - group: apps
+    kind: Deployment
+    jsonPointers:
+    - /spec/replicas
+  revisionHistoryLimit: 10
+EOF
+
+# Apply updated configuration
+kubectl apply -f argocd-application-selfheal.yaml
+
+# Create new drift to test self-healing
+kubectl scale deployment sample-app --replicas=6
+kubectl patch configmap sample-app-config --patch='{"data":{"app.properties":"environment=testing\ndebug=true\nlog.level=trace"}}'
+
+# Monitor self-healing process
+echo "Monitoring self-healing process..."
+for i in {1..30}; do
+    echo "Check $i:"
+    kubectl get deployment sample-app -o jsonpath='{.spec.replicas}' && echo " replicas"
+    argocd app get sample-app-health-monitor --output json | jq -r '.status.sync.status'
+    sleep 10
+done
+Subtask 3.6: Test Health Checks with Application Failures
+Simulate application failures to test health monitoring:
+
+# Create a failing deployment
+cat <<EOF > k8s-manifests/failing-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: failing-app
+  namespace: default
+  labels:
+    app: failing-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: failing-app
+  template:
+    metadata:
+      labels:
+        app: failing-app
+    spec:
+      containers:
+      - name: failing-container
+        image: nonexistent-image:latest
+        ports:
+        - containerPort: 80
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 3
+EOF
+
+# Commit the failing deployment
+cd ~/argocd-health-lab
+git add k8s-manifests/failing-deployment.yaml
+git commit -m "Add failing deployment for health monitoring test"
+
+# Sync and observe health status
+argocd app sync sample-app-health-monitor
+
+# Monitor the failing application
+echo "Monitoring application with failures..."
+for i in {1..20}; do
+    echo "--- Check $i ---"
+    argocd app get sample-app-health-monitor --output json | jq -r '.status.health'
+    kubectl get pods -l app=failing-app
+    echo
+    sleep 15
+done
+Task 4: Advanced Health Monitoring Configuration
+Subtask 4.1: Configure Custom Health Checks
+Create custom health check logic for specific resources:
+
+# Create advanced health configuration
+cat <<EOF > advanced-health-config.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+data:
+  # Custom health check for Deployments
+  resource.customizations.health.apps_Deployment: |
+    hs = {}
+    if obj.status ~= nil then
+      if obj.status.replicas ~= nil and obj.status.readyReplicas ~= nil then
+        if obj.status.replicas == obj.status.readyReplicas then
+          hs.status = "Healthy"
+          hs.message = "All replicas are ready"
+        else
+          hs.status = "Progressing"
+          hs.message = "Waiting for replicas to be ready"
+        end
+      else
+        hs.status = "Progressing"
+        hs.message = "Deployment is starting"
+      end
+    else
+      hs.status = "Progressing"
+      hs.message = "Deployment status unknown"
+    end
+    return hs
+  
+  # Custom health check for Services
+  resource.customizations.health.v1_Service: |
+    hs = {}
+    if obj.spec.type == "LoadBalancer" then
+      if obj.status.loadBalancer.ingress ~= nil and #obj.status.loadBalancer.ingress > 0 then
+        hs.status = "Healthy"
+        hs.message = "LoadBalancer has assigned IP"
+      else
+        hs.status = "Progressing"
+        hs.message = "Waiting for LoadBalancer IP assignment"
+      end
+    else
+      hs.status = "Healthy"
+      hs.message = "Service is ready"
+    end
+    return hs
+  
+  # Configure health check intervals
+  timeout.hard.reconciliation: 0
+  timeout.reconciliation: 180s
+  
+  # Application health assessment timeout
+  controller.status.processors: 20
+  controller.operation.processors: 10
+EOF
+
+# Apply advanced health configuration
+kubectl apply -f advanced-health-config.yaml
+
+# Restart controllers to apply changes
+kubectl rollout restart deployment/argocd-application-controller -n argocd
+kubectl rollout status deployment/argocd-application-controller -n argocd
+Subtask 4.2: Create Health Dashboard Script
+Create a comprehensive health monitoring dashboard:
+
+# Create health dashboard script
+cat <<EOF > health-dashboard.sh
+#!/bin/bash
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+clear_screen() {
+    clear
+    echo -e "\${BLUE}=== Argo CD Application Health Dashboard ===\${NC}"
+    echo -e "Application: sample-app-health-monitor"
+    echo -e "Timestamp: \$(date)"
+    echo -e "Press Ctrl+C to exit\n"
+}
+
+get_health_status() {
+    local app_name=\$1
+    local status=\$(argocd app get \$app_name --output json 2>/dev/null)
+    
+    if [ \$? -eq 0 ]; then
+        local health=\$(echo "\$status" | jq -r '.status.health.status // "Unknown"')
+        local sync=\$(echo "\$status" | jq -r '.status.sync.status // "Unknown"')
+        local revision=\$(echo "\$status" | jq -r '.status.sync.revision[0:8] // "Unknown"')
+        
+        # Color code health status
+        case \$health in
+            "Healthy") health_color="\${GREEN}\$health\${NC}" ;;
+            "Progressing") health_color="\${YELLOW}\$health\${NC}" ;;
+            "Degraded"|"Missing") health_color="\${RED}\$health\${NC}" ;;
+            *) health_color="\$health" ;;
+        esac
+        
+        # Color code sync status
+        case \$sync in
+            "Synced") sync_color="\${GREEN}\$sync\${NC}" ;;
+            "OutOfSync") sync_color="\${RED}\$sync\${NC}" ;;
+            *) sync_color="\$sync" ;;
+        esac
+        
+        echo -e "Health Status: \$health_color"
+        echo -e "Sync Status: \$sync_color"
+        echo -e "Git Revision: \$revision"
+        
+        # Show resource details
+        echo -e "\n\${BLUE}Resource Status:\${NC}"
+        echo "\$status" | jq -r '.status.resources[]? | "  \(.kind)/\(.name): \(.status)"' 2>/dev/null
+        
+        # Show conditions
+        echo -e "\n\${BLUE}Application Conditions:\${NC}"
+        echo "\$status" | jq -r '.status.conditions[]? | "  \(.type): \(.message)"' 2>/dev/null
+        
+    else
+        echo -e "\${RED}Failed to get application status\${NC}"
+    fi
+}
+
+get_cluster_resources() {
+    echo -e "\n\${BLUE}Cluster Resources:\${NC}"
+    echo -e "\${YELLOW}Deployments:\${NC}"
+    kubectl get deployments -l app=sample-app -o custom-columns="NAME:.metadata.name,READY:.status.readyReplicas,UP-TO-DATE:.status.updatedReplicas,AVAILABLE:.status.availableReplicas" 2>/dev/null
+    
+    echo -e "\n\${YELLOW}Pods:\${NC}"
+    kubectl get pods -l app=sample-app -o custom-columns="NAME:.metadata.name,STATUS:.status.phase,READY:.status.conditions[?(@.type=='Ready')].status" 2>/dev/null
+    
+    echo -e "\n\${YELLOW}Services:\${NC}"
+    kubectl get services -l app=sample-app -o custom-columns="NAME:.metadata.name,TYPE:.spec.type,CLUSTER-IP:.spec.clusterIP" 2>/dev/null
+}
+
+# Main monitoring loop
+while true; do
+    clear_screen
+    get_health_status "sample-app-health-monitor"
+    get_cluster_resources
+    echo -e "\n\${BLUE}Next update in 15 seconds...\${NC}"
+    sleep 15
+done
+EOF
+
+chmod +x health-dashboard.sh
+
+# Run the dashboard
+echo "Starting health dashboard..."
+echo "This will run for 2 minutes, then automatically stop"
+timeout 120 ./health-dashboard.sh || echo "Dashboard monitoring completed"
+Task 5: Troubleshooting and Best Practices
+Subtask 5.1: Common Health Monitoring Issues
+Create scenarios to demonstrate common issues and solutions:
+
+# Create a problematic deployment
+cat <<EOF > k8s-manifests/problematic-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: problematic-app
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: problematic-app
+  template:
+    metadata:
+      labels:
+        app: problematic-app
+    spec:
+      containers:
+      - name: app
+        image: nginx:1.21
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "1Gi"  # High memory request
+            cpu: "1000m"   # High CPU request
+          limits:
+            memory: "2Gi"
+            cpu: "2000m"
+        livenessProbe:
+          httpGet:
+            path: /nonexistent  # Wrong health check path
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 2
+        readinessProbe:
+          httpGet:
+            path: /nonexistent  # Wrong readiness check path
+            port: 80
+          initialDelaySeconds: 3
+          periodSeconds: 3
+          failureThreshold: 2
+EOF
+
+# Commit problematic deployment
+cd ~/argocd-health-lab
+git add k8s-manifests/problematic-deployment.yaml
+git commit -m "Add problematic deployment for troubleshooting"
+
+# Sync and observe issues
+argocd app sync sample-app-health-monitor
+
+# Create troubleshooting script
+cat <<EOF > troubleshoot-health.sh
+#!/bin/bash
+
+echo "=== Health Monitoring Troubleshooting ==="
+echo
+
+# Check application status
+echo "1. Application Status:"
+argocd app get sample-app-health-monitor --output json | jq '.status.health, .status.sync'
+echo
+
+# Check resource events
+echo "2. Resource Events:"
+kubectl get events --sort-by=.metadata.creationTimestamp -n default | grep problematic-app | tail -10
+echo
+
+# Check pod status and logs
+echo "3. Pod Status:"
+kubectl get pods -l app=problematic-app -o wide
+echo
+
+echo "4. Pod Logs (if any pods exist):"
+PODS=\$(kubectl get pods -l app=problematic-app -o jsonpath='{.items[*].metadata.name}')
+for pod in \$PODS; do
+    echo "--- Logs for \$pod ---"
+    kubectl logs \$pod --tail=20 2>/dev/null || echo "No logs available"
+done
+echo
+
+# Check resource usage
+echo "5. Node Resources:"
+kubectl top nodes 2>/dev/null || echo "Metrics server not available"
+echo
+
+# Provide recommendations
+echo "6. Troubleshooting Recommendations:"
+echo "   - Check resource requests vs available cluster resources"
+echo "   - Verify health check endpoints are correct"
+echo "   - Review application logs for startup issues"
+echo "   - Check if images are accessible"
+echo "   - Verify network policies and service configurations"
+EOF
+
+chmod +x troubleshoot-health.sh
+./troubleshoot-health.sh
+Subtask 5.2: Implement Health Monitoring Best Practices
+Create a best practices configuration:
+
+# Create optimized application configuration
+cat <<EOF > k8s-manifests/optimized-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: optimized-app
+  namespace: default
+  labels:
+    app: optimized-app
+    version: v1.0.0
+  annotations:
+    argocd.argoproj.io/sync-wave: "1"
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app: optimized-app
+  template:
+    metadata:
+      labels:
+        app: optimized-app
+        version: v1.0.0
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.21-alpine
+        ports:
+        - containerPort: 80
+          name: http
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "100m"
+          limits:
+            memory: "64Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+          successThreshold: 1
+        readinessProbe:
+          httpGet:
+            path: /
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+          successThreshold: 1
+        startupProbe:
+          httpGet:
+            path: /
+            port: http
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 10
+          successThreshold: 1
+        env:
+        - name: NGINX_PORT
+          value: "80"
+        volumeMounts:
+        - name: config
+          mountPath: /etc/nginx/conf.d
+      volumes:
+      - name: config
+        configMap:
+          name: optimized-app-config
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: optimized-app-config
+  namespace: default
+data:
+  default.conf: |
+    server {
+        listen 80;
+        server_name localhost;
+        
+        location / {
+            return 200 'Optimized App is Healthy!';
+            add_header Content-Type text/plain;
+        }
+        
+        location /health {
+            access_log off;
+            return 200 'OK';
+            add_header Content-Type text/plain;
+        }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: optimized-app-service
+  namespace: default
+  labels:
+    app: optimized-app
+spec:
+  selector:
+    app: optimized-app
+  ports:
+  - name: http
+    protocol: TCP
+    port: 80
+    targetPort: http
+  type: ClusterIP
+EOF
+
+# Remove problematic deployment and add optimized one
+rm k8s-manifests/problematic-deployment.yaml
+rm k8s-manifests/failing-deployment.yaml
+
+# Commit optimized configuration
+git add .
+git commit -m "Replace problematic deployments with optimized configuration"
+
+# Sync application
+argocd app sync sample-app-health-monitor
+
+# Wait for deployment
+kubectl rollout status deployment/optimized-app --timeout=300s
+
+# Verify health
+argocd app get sample-app-health-monitor
+kubectl get all -l app=optimized-app
+Conclusion
+In this lab, you have successfully:
+
+Learned Key Concepts:
+
+Application Health Monitoring: Understood how Argo CD continuously monitors the health status of deployed applications using Kubernetes health checks and custom health assessments
+Configuration Drift Detection: Experienced how Argo CD detects discrepancies between the desired state in Git and the actual state in the cluster
+Self-Healing Capabilities: Implemented and tested automatic drift correction to maintain application consistency
+Completed Technical Tasks:
+
+Set up a complete Argo CD environment with health monitoring enabled
+Created and deployed applications with comprehensive health checks including liveness, readiness, and startup probes
+Simulated configuration drift scenarios and observed how Argo CD detects and reports these discrepancies
+Implemented self-healing policies to automatically correct configuration drift
+Configured custom health check logic for different resource types
+Built monitoring dashboards and troubleshooting tools for ongoing health assessment
+Gained Practical Skills:
+
+Configuring health monitoring parameters and thresholds
+Interpreting health status indicators and sync states
+Troubleshooting common health monitoring issues
+Implementing best practices for reliable application health monitoring
+Creating comprehensive monitoring and alerting strategies
+Why This Matters: Application health monitoring is crucial for maintaining reliable, production-ready systems. Argo CD's health monitoring capabilities ensure that your applications remain in their desired state, automatically detecting and optionally correcting any drift from the intended configuration. This reduces manual intervention, improves system reliability, and provides early warning of
