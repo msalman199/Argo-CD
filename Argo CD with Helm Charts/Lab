@@ -1,0 +1,630 @@
+Argo CD with Helm Charts
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Install and configure Helm package manager in a Kubernetes cluster
+Set up Argo CD for GitOps-based application deployment
+Create and deploy applications using Helm charts through Argo CD
+Understand the integration between Helm and Argo CD for continuous deployment
+Manage application lifecycle using GitOps principles with Helm charts
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Kubernetes concepts (pods, services, deployments)
+Familiarity with YAML configuration files
+Basic knowledge of Git version control
+Understanding of containerization concepts
+Experience with command-line interface operations
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated environment. The provided Linux machine is bare metal with no pre-installed tools, so you will install all required components during the lab exercises.
+
+Task 1: Install and Configure Helm in Kubernetes
+Subtask 1.1: Set Up the Kubernetes Environment
+First, we need to install and configure a Kubernetes cluster on our Linux machine.
+
+Step 1: Update the system and install required packages
+
+sudo apt update && sudo apt upgrade -y
+sudo apt install -y curl wget apt-transport-https ca-certificates gnupg lsb-release
+Step 2: Install Docker
+
+# Add Docker's official GPG key
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+# Add Docker repository
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Install Docker
+sudo apt update
+sudo apt install -y docker-ce docker-ce-cli containerd.io
+
+# Add current user to docker group
+sudo usermod -aG docker $USER
+newgrp docker
+
+# Verify Docker installation
+docker --version
+Step 3: Install kubectl
+
+# Download kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+# Make kubectl executable
+chmod +x kubectl
+
+# Move kubectl to PATH
+sudo mv kubectl /usr/local/bin/
+
+# Verify kubectl installation
+kubectl version --client
+Step 4: Install and start Minikube
+
+# Download Minikube
+curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+
+# Install Minikube
+sudo install minikube-linux-amd64 /usr/local/bin/minikube
+
+# Start Minikube cluster
+minikube start --driver=docker --cpus=2 --memory=4096
+
+# Verify cluster is running
+kubectl cluster-info
+kubectl get nodes
+Subtask 1.2: Install Helm Package Manager
+Step 1: Download and install Helm
+
+# Download Helm installation script
+curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
+
+# Make the script executable
+chmod 700 get_helm.sh
+
+# Run the installation script
+./get_helm.sh
+
+# Verify Helm installation
+helm version
+Step 2: Add popular Helm repositories
+
+# Add the official Helm stable repository
+helm repo add stable https://charts.helm.sh/stable
+
+# Add Bitnami repository
+helm repo add bitnami https://charts.bitnami.com/bitnami
+
+# Update repository information
+helm repo update
+
+# List available repositories
+helm repo list
+Subtask 1.3: Create a Sample Helm Chart
+Step 1: Create a new Helm chart
+
+# Create a directory for our Helm charts
+mkdir -p ~/helm-charts
+cd ~/helm-charts
+
+# Create a new Helm chart
+helm create sample-app
+
+# Examine the chart structure
+ls -la sample-app/
+tree sample-app/ || find sample-app/ -type f
+Step 2: Customize the Helm chart
+
+# Edit the values.yaml file
+cat > sample-app/values.yaml << 'EOF'
+replicaCount: 2
+
+image:
+  repository: nginx
+  pullPolicy: IfNotPresent
+  tag: "1.21"
+
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+
+resources:
+  limits:
+    cpu: 100m
+    memory: 128Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+EOF
+Step 3: Test the Helm chart
+
+# Validate the chart
+helm lint sample-app/
+
+# Dry run to see what would be deployed
+helm install sample-app-test sample-app/ --dry-run --debug
+
+# Install the chart
+helm install sample-app sample-app/
+
+# Verify the deployment
+kubectl get pods
+kubectl get services
+helm list
+Task 2: Use Helm Charts for Application Deployment via Argo CD
+Subtask 2.1: Install Argo CD
+Step 1: Create Argo CD namespace and install
+
+# Create namespace for Argo CD
+kubectl create namespace argocd
+
+# Install Argo CD
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Wait for Argo CD pods to be ready
+kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
+
+# Verify Argo CD installation
+kubectl get pods -n argocd
+Step 2: Access Argo CD UI
+
+# Get the initial admin password
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d && echo
+
+# Port forward to access Argo CD UI
+kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+
+# Note: The UI will be available at https://localhost:8080
+# Username: admin
+# Password: (the output from the previous command)
+Step 3: Install Argo CD CLI
+
+# Download Argo CD CLI
+curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+
+# Make it executable and move to PATH
+chmod +x argocd-linux-amd64
+sudo mv argocd-linux-amd64 /usr/local/bin/argocd
+
+# Verify installation
+argocd version --client
+Subtask 2.2: Set Up Git Repository for GitOps
+Step 1: Create a local Git repository
+
+# Create a directory for our GitOps repository
+mkdir -p ~/gitops-repo
+cd ~/gitops-repo
+
+# Initialize Git repository
+git init
+git config user.name "Lab User"
+git config user.email "user@lab.local"
+
+# Create directory structure
+mkdir -p apps/sample-app
+mkdir -p charts
+Step 2: Copy Helm chart to Git repository
+
+# Copy our Helm chart to the Git repository
+cp -r ~/helm-charts/sample-app ~/gitops-repo/charts/
+
+# Create an Argo CD application manifest
+cat > apps/sample-app/application.yaml << 'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sample-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: file:///home/$(whoami)/gitops-repo
+    targetRevision: HEAD
+    path: charts/sample-app
+    helm:
+      valueFiles:
+      - values.yaml
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+EOF
+Step 3: Commit changes to Git
+
+# Add all files to Git
+git add .
+
+# Commit the changes
+git commit -m "Initial commit with sample Helm chart and Argo CD application"
+
+# Create a simple Git server (for demonstration purposes)
+git config --bool core.bare true
+cd ~/gitops-repo
+git clone --bare . ~/gitops-repo.git
+cd ~/gitops-repo.git
+git config --bool core.bare true
+Subtask 2.3: Configure Argo CD with Helm Charts
+Step 1: Login to Argo CD
+
+# Get the admin password again if needed
+ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+
+# Login to Argo CD (make sure port-forward is still running)
+argocd login localhost:8080 --username admin --password $ARGOCD_PASSWORD --insecure
+Step 2: Add Git repository to Argo CD
+
+# Add the local Git repository
+argocd repo add file:///home/$(whoami)/gitops-repo --name local-repo
+
+# List repositories
+argocd repo list
+Step 3: Create Argo CD application using Helm chart
+
+# Create application using CLI
+argocd app create sample-helm-app \
+  --repo file:///home/$(whoami)/gitops-repo \
+  --path charts/sample-app \
+  --dest-server https://kubernetes.default.svc \
+  --dest-namespace default \
+  --helm-set replicaCount=3 \
+  --sync-policy automated \
+  --auto-prune \
+  --self-heal
+
+# List applications
+argocd app list
+
+# Get application details
+argocd app get sample-helm-app
+Subtask 2.4: Deploy and Manage Applications
+Step 1: Sync the application
+
+# Sync the application
+argocd app sync sample-helm-app
+
+# Wait for sync to complete
+argocd app wait sample-helm-app
+
+# Check application status
+argocd app get sample-helm-app
+Step 2: Verify deployment in Kubernetes
+
+# Check pods created by Argo CD
+kubectl get pods -l app.kubernetes.io/instance=sample-helm-app
+
+# Check services
+kubectl get services -l app.kubernetes.io/instance=sample-helm-app
+
+# Get detailed information about the deployment
+kubectl describe deployment sample-helm-app
+Step 3: Update application through Git
+
+# Go back to our working Git repository
+cd ~/gitops-repo
+
+# Update the Helm chart values
+cat > charts/sample-app/values.yaml << 'EOF'
+replicaCount: 4
+
+image:
+  repository: nginx
+  pullPolicy: IfNotPresent
+  tag: "1.22"
+
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 80
+
+ingress:
+  enabled: false
+
+resources:
+  limits:
+    cpu: 200m
+    memory: 256Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+EOF
+
+# Commit the changes
+git add .
+git commit -m "Update nginx version and increase replicas to 4"
+
+# Update the bare repository
+git push ~/gitops-repo.git main:main
+Step 4: Observe automatic synchronization
+
+# Refresh the application to detect changes
+argocd app refresh sample-helm-app
+
+# Watch the sync process
+argocd app sync sample-helm-app
+
+# Verify the changes
+kubectl get pods -l app.kubernetes.io/instance=sample-helm-app
+kubectl describe deployment sample-helm-app | grep -A 5 "Image:"
+Subtask 2.5: Advanced Helm Integration with Argo CD
+Step 1: Create a more complex Helm chart
+
+# Create a new Helm chart for a web application
+cd ~/gitops-repo/charts
+helm create webapp
+
+# Customize the webapp chart
+cat > webapp/values.yaml << 'EOF'
+replicaCount: 2
+
+image:
+  repository: httpd
+  pullPolicy: IfNotPresent
+  tag: "2.4"
+
+nameOverride: "webapp"
+fullnameOverride: "my-webapp"
+
+service:
+  type: NodePort
+  port: 80
+  nodePort: 30080
+
+ingress:
+  enabled: false
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 250m
+    memory: 256Mi
+
+env:
+  - name: ENVIRONMENT
+    value: "production"
+  - name: LOG_LEVEL
+    value: "info"
+
+configMap:
+  enabled: true
+  data:
+    config.conf: |
+      ServerName localhost
+      DocumentRoot /usr/local/apache2/htdocs
+      ErrorLog /proc/self/fd/2
+      CustomLog /proc/self/fd/1 common
+EOF
+Step 2: Update deployment template to use ConfigMap
+
+# Update the deployment template
+cat > webapp/templates/deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "webapp.fullname" . }}
+  labels:
+    {{- include "webapp.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "webapp.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "webapp.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          {{- if .Values.env }}
+          env:
+            {{- toYaml .Values.env | nindent 12 }}
+          {{- end }}
+          {{- if .Values.configMap.enabled }}
+          volumeMounts:
+            - name: config-volume
+              mountPath: /usr/local/apache2/conf/extra/
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- if .Values.configMap.enabled }}
+      volumes:
+        - name: config-volume
+          configMap:
+            name: {{ include "webapp.fullname" . }}-config
+      {{- end }}
+EOF
+Step 3: Create ConfigMap template
+
+# Create ConfigMap template
+cat > webapp/templates/configmap.yaml << 'EOF'
+{{- if .Values.configMap.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "webapp.fullname" . }}-config
+  labels:
+    {{- include "webapp.labels" . | nindent 4 }}
+data:
+  {{- toYaml .Values.configMap.data | nindent 2 }}
+{{- end }}
+EOF
+Step 4: Deploy the new application with Argo CD
+
+# Commit the new chart
+git add .
+git commit -m "Add webapp Helm chart with ConfigMap"
+git push ~/gitops-repo.git main:main
+
+# Create new Argo CD application
+argocd app create webapp \
+  --repo file:///home/$(whoami)/gitops-repo \
+  --path charts/webapp \
+  --dest-server https://kubernetes.default.svc \
+  --dest-namespace default \
+  --sync-policy automated \
+  --auto-prune \
+  --self-heal
+
+# Sync the application
+argocd app sync webapp
+
+# Verify deployment
+kubectl get pods -l app.kubernetes.io/name=webapp
+kubectl get configmap -l app.kubernetes.io/name=webapp
+kubectl get service -l app.kubernetes.io/name=webapp
+Subtask 2.6: Monitor and Troubleshoot
+Step 1: Monitor application health
+
+# Check application health in Argo CD
+argocd app get webapp
+
+# View application logs
+kubectl logs -l app.kubernetes.io/name=webapp
+
+# Check events
+kubectl get events --sort-by=.metadata.creationTimestamp
+Step 2: Test application rollback
+
+# View application history
+argocd app history webapp
+
+# Create a problematic update
+cat > charts/webapp/values.yaml << 'EOF'
+replicaCount: 2
+
+image:
+  repository: httpd
+  pullPolicy: IfNotPresent
+  tag: "invalid-tag"
+
+nameOverride: "webapp"
+fullnameOverride: "my-webapp"
+
+service:
+  type: NodePort
+  port: 80
+  nodePort: 30080
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 250m
+    memory: 256Mi
+
+env:
+  - name: ENVIRONMENT
+    value: "production"
+
+configMap:
+  enabled: true
+  data:
+    config.conf: |
+      ServerName localhost
+EOF
+
+# Commit the problematic change
+git add .
+git commit -m "Update to invalid image tag"
+git push ~/gitops-repo.git main:main
+
+# Sync and observe the failure
+argocd app sync webapp
+argocd app get webapp
+
+# Rollback to previous version
+argocd app rollback webapp
+
+# Verify rollback
+kubectl get pods -l app.kubernetes.io/name=webapp
+Step 3: Clean up resources
+
+# Delete Argo CD applications
+argocd app delete sample-helm-app --cascade
+argocd app delete webapp --cascade
+
+# Delete the sample-app deployment created directly with Helm
+helm uninstall sample-app
+
+# Verify cleanup
+kubectl get pods
+argocd app list
+Troubleshooting Tips
+Common Issues and Solutions
+Issue 1: Argo CD server not accessible
+
+Ensure port-forward is running: kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+Check if Argo CD pods are running: kubectl get pods -n argocd
+Issue 2: Git repository not accessible
+
+Verify repository path is correct
+Ensure Git repository has been properly initialized and committed
+Issue 3: Helm chart validation errors
+
+Run helm lint <chart-path> to identify issues
+Check YAML syntax and indentation
+Verify template functions are correctly used
+Issue 4: Application sync failures
+
+Check application logs: argocd app logs <app-name>
+Verify Kubernetes cluster has sufficient resources
+Check for conflicting resource names
+Issue 5: Pods not starting
+
+Check pod logs: kubectl logs <pod-name>
+Verify image names and tags are correct
+Check resource limits and requests
+Conclusion
+In this comprehensive lab, you have successfully:
+
+Installed and configured Helm as a package manager for Kubernetes applications
+Set up Argo CD for GitOps-based continuous deployment
+Created custom Helm charts with configurable values and templates
+Integrated Helm charts with Argo CD for automated application deployment
+Implemented GitOps workflows using Git repositories as the source of truth
+Managed application lifecycle including updates, rollbacks, and monitoring
+Troubleshot common issues in Helm and Argo CD deployments
+This lab demonstrates the powerful combination of Helm and Argo CD for modern Kubernetes application deployment. Helm provides templating and packaging capabilities, while Argo CD ensures that your cluster state matches your Git repository through continuous monitoring and synchronization.
+
+The GitOps approach you've learned enables:
+
+Declarative configuration management through Git
+Automated deployment pipelines without manual intervention
+Version control for all infrastructure and application changes
+Easy rollbacks to previous working states
+Audit trails of all changes through Git history
+These skills are essential for modern DevOps practices and will help you implement reliable, scalable, and maintainable deployment pipelines in production environments.
