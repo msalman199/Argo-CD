@@ -1,0 +1,191 @@
+Application Definition with Git
+Objectives
+Design and deploy a containerized application to Kubernetes using raw manifests and a Helm chart managed entirely through a local Git repository
+Configure Argo CD to watch the Git repository and automatically reconcile cluster state with declared configuration
+Demonstrate a GitOps update cycle by committing a version change and verifying Argo CD propagates it to the cluster without manual kubectl intervention
+Prerequisites
+Comfort with Linux command-line operations including file editing, process management, and reading command output
+Conceptual understanding of containers, Kubernetes workloads (Deployment, Service), and version control with Git
+Lab Environment
+You will work on a dedicated AWS EC2 Ubuntu instance provided by Al Nafi. The instance has a base Ubuntu installation; you will install all required tools in Task 1.
+
+Task 1: Install and Verify the Full Toolchain
+Requirement 1
+Install Docker, kubectl, Helm, kind (Kubernetes-in-Docker), and the Argo CD CLI on the bare Ubuntu instance. Create a single-node kind cluster named gitops-lab, deploy Argo CD into it, and confirm every component reaches a healthy state before proceeding.
+
+# -- Docker --
+sudo apt-get update -y
+sudo apt-get install -y ca-certificates curl gnupg
+sudo install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+# Official guide if this URL changes: https://docs.docker.com/engine/install/ubuntu/
+printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu %s stable\n' \
+  "$(dpkg --print-architecture)" \
+  "$(. /etc/os-release && echo "$VERSION_CODENAME")" \
+  | sudo tee /etc/apt/sources.list.d/docker.list
+
+sudo apt-get update -y
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+sudo usermod -aG docker "$USER"
+newgrp docker
+docker version
+Troubleshoot this step:
+
+Error seen: E: Malformed entry 1 in list file /etc/apt/sources.list.d/docker.list
+Recovery: cat /etc/apt/sources.list.d/docker.list â the file must be one unbroken line with no backslashes; delete it with sudo rm /etc/apt/sources.list.d/docker.list and re-run the printf command above.
+Docs: https://docs.docker.com/engine/install/ubuntu/
+# -- kubectl --
+# Official guide if this URL changes: https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/
+KUBE_VERSION="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"
+curl -fsSL "https://dl.k8s.io/release/${KUBE_VERSION}/bin/linux/amd64/kubectl" \
+  -o /tmp/kubectl
+sudo install -o root -g root -m 0755 /tmp/kubectl /usr/local/bin/kubectl
+kubectl version --client
+# -- Helm --
+# Official guide if this URL changes: https://helm.sh/docs/intro/install/
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+Troubleshoot this step:
+
+Error seen: curl: (22) The requested URL returned error: 404 when fetching the Helm install script.
+Recovery: Visit https://helm.sh/docs/intro/install/ and use the binary download method listed there for Linux amd64.
+Docs: https://helm.sh/docs/intro/install/
+# -- kind --
+# Official guide if this URL changes: https://kind.sigs.k8s.io/docs/user/quick-start/#installation
+curl -fsSL -o /tmp/kind \
+  "https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64"
+sudo install -o root -g root -m 0755 /tmp/kind /usr/local/bin/kind
+kind version
+# -- kind cluster --
+kind create cluster --name gitops-lab
+kubectl cluster-info --context kind-gitops-lab
+kubectl get nodes
+Troubleshoot this step:
+
+Error seen: ERROR: failed to create cluster: node(s) already exist for a cluster with the name "gitops-lab"
+Recovery: kind delete cluster --name gitops-lab then re-run the create command.
+Docs: https://kind.sigs.k8s.io/docs/user/quick-start/
+# -- Argo CD --
+# Official guide if this URL changes: https://argo-cd.readthedocs.io/en/stable/getting_started/
+kubectl create namespace argocd
+kubectl apply -n argocd \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+kubectl wait --for=condition=available --timeout=300s \
+  deployment/argocd-server -n argocd
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d > ~/argocd-password.txt
+echo "Argo CD admin password stored at ~/argocd-password.txt"
+Troubleshoot this step:
+
+Error seen: error: timed out waiting for the condition on deployments/argocd-server
+Recovery: kubectl get pods -n argocd â identify any pod in ImagePullBackOff or CrashLoopBackOff and run kubectl describe pod <pod-name> -n argocd to read the specific failure reason.
+Docs: https://argo-cd.readthedocs.io/en/stable/getting_started/
+# -- Argo CD CLI --
+# Official guide if this URL changes: https://argo-cd.readthedocs.io/en/stable/cli_installation/
+ARGOCD_VERSION="$(curl -fsSL https://api.github.com/repos/argoproj/argo-cd/releases/latest \
+  | grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)".*/\1/')"
+curl -fsSL -o /tmp/argocd \
+  "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64"
+sudo install -o root -g root -m 0755 /tmp/argocd /usr/local/bin/argocd
+argocd version --client
+# -- Expose Argo CD and log in --
+kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+sleep 5
+argocd login localhost:8080 \
+  --username admin \
+  --password "$(cat ~/argocd-password.txt)" \
+  --insecure
+argocd account get-user-info
+Acceptance Criteria
+kubectl get nodes shows one node in Ready state, kubectl get pods -n argocd shows all pods in Running state, and argocd account get-user-info returns Logged In: true without error.
+docker version, kubectl version --client, helm version, kind version, and argocd version --client each print a version string with exit code 0.
+Task 2: Build the Application and Define It in Git
+Requirement 1
+Design and implement a Git repository at ~/gitops-lab that contains two independent deployment definitions for a containerized web application of your own design: one using raw Kubernetes manifests (Namespace, Deployment, Service) and one using a valid Helm chart with at minimum a Chart.yaml, values.yaml, and templated Deployment and Service. The container image must be built locally with Docker and loaded into the kind cluster so that imagePullPolicy: Never works correctly. Commit all files with meaningful commit messages and tag the initial state as v1.0.0.
+
+The following constraints apply:
+
+The Deployment in both definitions must declare CPU and memory requests and limits.
+The Deployment in both definitions must include a readinessProbe targeting the application's HTTP port.
+The Helm chart must use named template helpers (_helpers.tpl) for the full application name and selector labels â no hard-coded strings in templates.
+The raw manifests directory must include a kustomization.yaml that lists all resources.
+helm lint must exit 0 before you commit the chart.
+# Verify image is present in the kind cluster after you load it:
+docker exec gitops-lab-control-plane crictl images 2>/dev/null | grep "<your-image-name>"
+# Expected: one line showing the image name and your chosen tag.
+
+# Verify helm lint passes:
+helm lint ~/gitops-lab/apps/sample-app/helm-chart/
+# Expected: "1 chart(s) linted, 0 chart(s) failed"
+
+# Verify git log shows your tag:
+git -C ~/gitops-lab log --oneline --decorate
+# Expected: HEAD commit decorated with tag v1.0.0
+Acceptance Criteria
+helm lint ~/gitops-lab/apps/sample-app/helm-chart/ exits 0 with the message 0 chart(s) failed, and kubectl apply --dry-run=client -f ~/gitops-lab/apps/sample-app/manifests/ exits 0 with no validation errors.
+docker exec gitops-lab-control-plane crictl images 2>/dev/null lists the application image at tag v1.0.0, and git -C ~/gitops-lab log --oneline --decorate shows at least one commit tagged v1.0.0.
+Requirement 2
+Make the Git repository accessible to Argo CD running inside the kind cluster by initialising a bare-style repository that Argo CD can reach via a file:// URL, then create two Argo CD Application resources â one pointing at the manifests path and one pointing at the Helm chart path â both targeting the gitops-lab cluster and configured with automated sync, self-heal, and namespace auto-creation enabled. Apply both Application manifests and confirm Argo CD reports Synced and Healthy for each.
+
+The following constraints apply:
+
+Both Applications must set syncPolicy.automated.prune: true and syncPolicy.automated.selfHeal: true.
+The manifests-based Application must deploy into a namespace named sample-app.
+The Helm-based Application must deploy into a namespace named sample-app-helm and must override replicaCount to 3 via an Argo CD parameters entry (not by editing values.yaml).
+You must register the repository URL with Argo CD using argocd repo add before applying the Application manifests.
+# After applying both Application manifests, poll until both are Synced:
+argocd app list
+# Expected: two rows, both showing Sync Status = Synced and Health Status = Healthy
+
+# Verify replica count override took effect for the Helm app:
+kubectl get deployment -n sample-app-helm -o jsonpath='{.items[0].spec.replicas}'
+# Expected: 3
+Acceptance Criteria
+argocd app list shows both applications with STATUS=Synced and HEALTH=Healthy, and kubectl get pods -n sample-app and kubectl get pods -n sample-app-helm each show all pods in Running state.
+kubectl get deployment -n sample-app-helm -o jsonpath='{.items[0].spec.replicas}' prints 3, confirming the parameter override was applied by Argo CD without modifying values.yaml.
+Task 3: Execute and Verify a GitOps Update Cycle
+Requirement 1
+Demonstrate a complete GitOps update cycle. Modify the application (change visible content and update the version identifier), build a new image tagged v1.1.0, load it into the kind cluster, update the image tag reference in both the raw manifests and the Helm chart values, commit the changes with tag v1.1.0, refresh the repository source accessible to Argo CD, and allow or trigger Argo CD to sync. The running pods must serve the updated content without any direct kubectl set image or kubectl rollout commands â the change must flow exclusively through the Git commit.
+
+The following constraints apply:
+
+You must not use kubectl set image, kubectl edit, or kubectl patch to change the image on the running Deployment â the only permitted mechanism is a Git commit followed by an Argo CD sync.
+After the sync, kubectl rollout status deployment -n sample-app and kubectl rollout status deployment -n sample-app-helm must both exit 0.
+The updated content must be verifiable via curl through a kubectl port-forward session.
+# After sync completes, verify the running image tag in each namespace:
+kubectl get deployment -n sample-app \
+  -o jsonpath='{.items[0].spec.template.spec.containers[0].image}'
+# Expected: your image name followed by :v1.1.0
+
+kubectl get deployment -n sample-app-helm \
+  -o jsonpath='{.items[0].spec.template.spec.containers[0].image}'
+# Expected: your image name followed by :v1.1.0
+Acceptance Criteria
+Both kubectl get deployment -n sample-app -o jsonpath='{.items[0].spec.template.spec.containers[0].image}' and the equivalent command for sample-app-helm return the image at tag v1.1.0, and kubectl rollout status deployment -n sample-app and kubectl rollout status deployment -n sample-app-helm both exit 0.
+A kubectl port-forward session to each Service followed by curl -s http://localhost:<port> returns HTTP 200 and response body content that differs visibly from the v1.0.0 response, confirming the updated application is serving traffic.
+Requirement 2
+Validate Argo CD's self-healing behaviour. Manually delete one of the Deployments in the sample-app namespace using kubectl delete, then observe â without issuing any sync command â that Argo CD recreates it automatically within the sync interval. Record the time elapsed between deletion and full pod readiness.
+
+The following constraints apply:
+
+You must not run argocd app sync or kubectl apply after the deletion â self-heal must trigger autonomously.
+The Deployment must return to Available condition within 3 minutes of deletion.
+You must capture the Argo CD event log showing the self-heal action using argocd app get sample-app-manifests output.
+# After deletion, watch until the Deployment reappears and pods are Running:
+kubectl get pods -n sample-app --watch
+# Expected: pods disappear briefly then new pods appear and reach Running state
+
+# Capture the self-heal event from Argo CD:
+argocd app get sample-app-manifests
+# Expected: output includes an event or condition referencing "self heal" or "OutOfSync" followed by "Synced"
+Acceptance Criteria
+Within 3 minutes of the kubectl delete deployment command, kubectl get deployment -n sample-app lists the Deployment again and kubectl rollout status deployment -n sample-app exits 0, with no manual sync command issued in the interim.
+argocd app get sample-app-manifests output contains a condition or event entry showing the application transitioned from OutOfSync back to Synced autonomously, confirming self-heal fired.
+Expected Outcomes
+Two independently managed Argo CD Applications â one manifest-based, one Helm-based â both continuously reconciled from a local Git repository, with a completed v1.0.0-to-v1.1.0 update cycle demonstrable entirely through Git commits.
+Argo CD self-healing verified empirically: a manually deleted Deployment is restored to full readiness within 3 minutes without operator intervention.
+Conclusion
+This lab required you to construct a complete GitOps pipeline from an empty Ubuntu instance: toolchain installation, container image authoring, dual-format application definition in Git, Argo CD integration, and a live update cycle driven solely by commits. The self-healing exercise demonstrated why declarative state management in Git is more resilient than imperative cluster commands. Extend this pattern by replacing the local file-based repository with a remote Git host and adding a CI pipeline that builds and pushes images on every merge to main.
