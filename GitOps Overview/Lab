@@ -1,0 +1,448 @@
+GitOps Overview
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Understand the core principles and benefits of GitOps methodology
+Set up and configure a local Git repository for GitOps workflows
+Create Kubernetes manifests following GitOps best practices
+Install and configure Argo CD on a single Linux machine
+Deploy applications using Argo CD and Git-based workflows
+Demonstrate how Git serves as the single source of truth for deployments
+Troubleshoot common GitOps deployment issues
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Git version control concepts
+Familiarity with Kubernetes fundamentals (pods, services, deployments)
+Basic Linux command-line experience
+Understanding of YAML file structure
+Knowledge of container concepts and Docker basics
+Lab Environment
+Al Nafi Cloud Machine: This lab runs entirely on a single Linux-based cloud machine provided by Al Nafi. Simply click Start Lab to access your dedicated environment. The machine comes as bare metal with no pre-installed tools, so you will install all required components during the lab exercises.
+
+System Requirements: The provided Linux machine has sufficient resources to run all components locally, including Kubernetes, Argo CD, and Git repositories.
+
+Task 1: Environment Setup and Tool Installation
+Subtask 1.1: Update System and Install Prerequisites
+First, update your system and install essential tools:
+
+# Update package manager
+sudo apt update && sudo apt upgrade -y
+
+# Install essential tools
+sudo apt install -y curl wget git vim nano tree jq
+
+# Install Docker
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+sudo usermod -aG docker $USER
+newgrp docker
+
+# Verify Docker installation
+docker --version
+Subtask 1.2: Install Kubernetes (Kind)
+Install Kind (Kubernetes in Docker) for local Kubernetes cluster:
+
+# Download and install Kind
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+chmod +x ./kind
+sudo mv ./kind /usr/local/bin/kind
+
+# Verify Kind installation
+kind --version
+
+# Install kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+chmod +x kubectl
+sudo mv kubectl /usr/local/bin/
+
+# Verify kubectl installation
+kubectl version --client
+Subtask 1.3: Create Kubernetes Cluster
+Create a local Kubernetes cluster using Kind:
+
+# Create cluster configuration file
+cat << EOF > kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"
+  extraPortMappings:
+  - containerPort: 80
+    hostPort: 8080
+    protocol: TCP
+  - containerPort: 443
+    hostPort: 8443
+    protocol: TCP
+EOF
+
+# Create the cluster
+kind create cluster --config=kind-config.yaml --name=gitops-lab
+
+# Verify cluster is running
+kubectl cluster-info
+kubectl get nodes
+Task 2: Set up Git Repository
+Subtask 2.1: Initialize Local Git Repository
+Create a local Git repository to serve as your GitOps source:
+
+# Create project directory
+mkdir -p ~/gitops-demo
+cd ~/gitops-demo
+
+# Initialize Git repository
+git init
+git config user.name "GitOps Student"
+git config user.email "student@example.com"
+
+# Create initial directory structure
+mkdir -p applications/sample-app
+mkdir -p argocd-config
+
+# Create README file
+cat << EOF > README.md
+# GitOps Demo Repository
+
+This repository contains Kubernetes manifests managed through GitOps principles using Argo CD.
+
+## Structure
+- applications/: Application manifests
+- argocd-config/: Argo CD configuration files
+EOF
+
+# Add and commit initial files
+git add .
+git commit -m "Initial commit: GitOps repository structure"
+Subtask 2.2: Create Sample Application Manifests
+Create Kubernetes manifests for a sample application:
+
+# Create namespace manifest
+cat << EOF > applications/sample-app/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: sample-app
+  labels:
+    managed-by: argocd
+EOF
+
+# Create deployment manifest
+cat << EOF > applications/sample-app/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deployment
+  namespace: sample-app
+  labels:
+    app: nginx
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: nginx
+  template:
+    metadata:
+      labels:
+        app: nginx
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.21
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "250m"
+          limits:
+            memory: "128Mi"
+            cpu: "500m"
+EOF
+
+# Create service manifest
+cat << EOF > applications/sample-app/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: nginx-service
+  namespace: sample-app
+  labels:
+    app: nginx
+spec:
+  selector:
+    app: nginx
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+  type: ClusterIP
+EOF
+
+# Create kustomization file
+cat << EOF > applications/sample-app/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- namespace.yaml
+- deployment.yaml
+- service.yaml
+
+commonLabels:
+  managed-by: argocd
+  environment: demo
+EOF
+Subtask 2.3: Commit Application Manifests
+Add and commit the application manifests to Git:
+
+# Add all application files
+git add applications/
+
+# Commit the changes
+git commit -m "Add sample nginx application manifests"
+
+# View commit history
+git log --oneline
+
+# Display repository structure
+tree
+Task 3: Install and Configure Argo CD
+Subtask 3.1: Install Argo CD
+Install Argo CD in your Kubernetes cluster:
+
+# Create Argo CD namespace
+kubectl create namespace argocd
+
+# Install Argo CD
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Wait for Argo CD pods to be ready
+echo "Waiting for Argo CD to be ready..."
+kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
+
+# Verify Argo CD installation
+kubectl get pods -n argocd
+Subtask 3.2: Access Argo CD UI
+Configure access to the Argo CD web interface:
+
+# Get initial admin password
+ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+echo "Argo CD Admin Password: $ARGOCD_PASSWORD"
+
+# Port forward to access Argo CD UI
+kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+PORT_FORWARD_PID=$!
+
+echo "Argo CD UI will be available at: https://localhost:8080"
+echo "Username: admin"
+echo "Password: $ARGOCD_PASSWORD"
+echo "Note: Accept the self-signed certificate warning in your browser"
+
+# Install Argo CD CLI
+curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+rm argocd-linux-amd64
+
+# Login via CLI
+argocd login localhost:8080 --username admin --password $ARGOCD_PASSWORD --insecure
+Subtask 3.3: Configure Git Repository in Argo CD
+Add your local Git repository to Argo CD:
+
+# Get the absolute path of your Git repository
+REPO_PATH=$(pwd)
+echo "Repository path: $REPO_PATH"
+
+# Add repository to Argo CD (using local path)
+argocd repo add $REPO_PATH --type git --name local-gitops-repo
+
+# Verify repository was added
+argocd repo list
+Task 4: Create and Deploy Application using GitOps
+Subtask 4.1: Create Argo CD Application Manifest
+Create an Argo CD Application resource:
+
+# Create Argo CD application manifest
+cat << EOF > argocd-config/sample-app-application.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sample-nginx-app
+  namespace: argocd
+  labels:
+    app: sample-nginx
+spec:
+  project: default
+  source:
+    repoURL: $REPO_PATH
+    targetRevision: HEAD
+    path: applications/sample-app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: sample-app
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+EOF
+
+# Commit the Argo CD configuration
+git add argocd-config/
+git commit -m "Add Argo CD application configuration"
+Subtask 4.2: Deploy Application via Argo CD
+Deploy the application using Argo CD:
+
+# Apply the Argo CD application
+kubectl apply -f argocd-config/sample-app-application.yaml
+
+# Wait for application to sync
+echo "Waiting for application to sync..."
+sleep 30
+
+# Check application status
+argocd app get sample-nginx-app
+
+# List all applications
+argocd app list
+
+# Verify deployment in Kubernetes
+kubectl get all -n sample-app
+Subtask 4.3: Verify GitOps Workflow
+Test the GitOps workflow by making changes:
+
+# Modify the deployment to scale replicas
+sed -i 's/replicas: 2/replicas: 3/' applications/sample-app/deployment.yaml
+
+# Commit the change
+git add applications/sample-app/deployment.yaml
+git commit -m "Scale nginx deployment to 3 replicas"
+
+# Trigger manual sync (or wait for automatic sync)
+argocd app sync sample-nginx-app
+
+# Verify the change was applied
+kubectl get deployment nginx-deployment -n sample-app
+kubectl get pods -n sample-app
+Task 5: Demonstrate GitOps Principles
+Subtask 5.1: Test Drift Detection and Self-Healing
+Demonstrate how Argo CD detects and corrects configuration drift:
+
+# Manually scale deployment outside of Git
+kubectl scale deployment nginx-deployment --replicas=5 -n sample-app
+
+# Check current state
+kubectl get deployment nginx-deployment -n sample-app
+
+# Wait for Argo CD to detect drift and self-heal
+echo "Waiting for Argo CD self-healing..."
+sleep 60
+
+# Verify Argo CD corrected the drift
+kubectl get deployment nginx-deployment -n sample-app
+argocd app get sample-nginx-app
+Subtask 5.2: Update Application Configuration
+Make additional changes to demonstrate GitOps workflow:
+
+# Update nginx image version
+sed -i 's/nginx:1.21/nginx:1.22/' applications/sample-app/deployment.yaml
+
+# Add resource limits
+cat << EOF >> applications/sample-app/deployment.yaml
+        env:
+        - name: ENVIRONMENT
+          value: "gitops-demo"
+EOF
+
+# Commit changes
+git add applications/sample-app/deployment.yaml
+git commit -m "Update nginx to version 1.22 and add environment variable"
+
+# Sync application
+argocd app sync sample-nginx-app
+
+# Verify updates
+kubectl describe deployment nginx-deployment -n sample-app
+kubectl get pods -n sample-app -o wide
+Subtask 5.3: Monitor Application Health
+Check application health and status:
+
+# Get detailed application information
+argocd app get sample-nginx-app --show-params
+
+# Check application health
+argocd app wait sample-nginx-app --health
+
+# View application history
+argocd app history sample-nginx-app
+
+# Check sync status
+kubectl get applications -n argocd
+Task 6: Cleanup and Resource Management
+Subtask 6.1: Application Cleanup
+Clean up the deployed resources:
+
+# Delete the application from Argo CD
+argocd app delete sample-nginx-app --cascade
+
+# Verify application is removed
+kubectl get all -n sample-app
+kubectl get namespace sample-app
+Subtask 6.2: Stop Services
+Stop running services:
+
+# Stop port forwarding
+kill $PORT_FORWARD_PID 2>/dev/null || true
+
+# Optional: Delete the Kind cluster
+# kind delete cluster --name=gitops-lab
+Troubleshooting Common Issues
+Issue 1: Argo CD Pods Not Starting
+# Check pod status and logs
+kubectl get pods -n argocd
+kubectl logs -n argocd deployment/argocd-server
+
+# Restart Argo CD components if needed
+kubectl rollout restart deployment/argocd-server -n argocd
+Issue 2: Application Sync Failures
+# Check application events
+kubectl describe application sample-nginx-app -n argocd
+
+# View sync operation details
+argocd app get sample-nginx-app --show-operation
+
+# Manual sync with force
+argocd app sync sample-nginx-app --force
+Issue 3: Repository Connection Issues
+# Verify repository configuration
+argocd repo list
+
+# Test repository connectivity
+argocd repo get $REPO_PATH
+Key Concepts Learned
+Throughout this lab, you have learned several important GitOps concepts:
+
+Declarative Configuration: All application state is defined in Git using YAML manifests
+Git as Source of Truth: The Git repository serves as the single source of truth for deployments
+Automated Synchronization: Argo CD automatically syncs cluster state with Git repository state
+Drift Detection: Argo CD detects when cluster state differs from Git and can automatically correct it
+Self-Healing: Applications automatically return to their desired state as defined in Git
+Audit Trail: All changes are tracked through Git commits, providing complete audit history
+Conclusion
+In this comprehensive lab, you have successfully:
+
+Set up a complete GitOps environment on a single Linux machine using open-source tools
+Created and configured a Git repository with Kubernetes manifests following GitOps best practices
+Installed and configured Argo CD as your GitOps operator
+Deployed applications using GitOps workflows where Git serves as the source of truth
+Demonstrated key GitOps principles including drift detection, self-healing, and automated synchronization
+Experienced hands-on GitOps workflows by making changes through Git and observing automatic deployments
+Why GitOps Matters: GitOps revolutionizes how we deploy and manage applications by treating infrastructure and applications as code. This approach provides better security, reliability, and auditability compared to traditional deployment methods. By using Git as the source of truth, teams can leverage familiar development workflows for operations, enabling better collaboration between development and operations teams.
+
+The skills you have learned in this lab form the foundation for implementing GitOps in production environments, where these principles scale to manage hundreds of applications across multiple clusters while maintaining consistency, security, and reliability.
