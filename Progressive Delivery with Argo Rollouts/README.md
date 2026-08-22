@@ -1,0 +1,906 @@
+<div align="center">
+
+# 🐦 Progressive Delivery with Argo Rollouts
+
+![Argo Rollouts](https://img.shields.io/badge/Argo%20Rollouts-EF7B4D?style=for-the-badge&logo=argo&logoColor=white)
+![Kubernetes](https://img.shields.io/badge/Kubernetes-326CE5?style=for-the-badge&logo=kubernetes&logoColor=white)
+![kind](https://img.shields.io/badge/kind-4285F4?style=for-the-badge&logo=kubernetes&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
+![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
+![Progressive Delivery](https://img.shields.io/badge/Progressive%20Delivery-Canary%20%7C%20Blue--Green-blue?style=for-the-badge)
+
+**A hands-on lab for implementing canary and blue/green deployment strategies with Argo Rollouts**
+
+</div>
+
+---
+
+## 📑 Table of Contents
+
+- [🎯 Lab Objectives](#-lab-objectives)
+- [📋 Prerequisites](#-prerequisites)
+- [🖥️ Lab Environment Setup](#️-lab-environment-setup)
+- [🧩 Task 1: Environment Preparation and Tool Installation](#-task-1-environment-preparation-and-tool-installation)
+- [⚙️ Task 2: Install and Configure Argo Rollouts](#️-task-2-install-and-configure-argo-rollouts)
+- [🐤 Task 3: Implement Canary Deployment Strategy](#-task-3-implement-canary-deployment-strategy)
+- [🔵🟢 Task 4: Implement Blue/Green Deployment Strategy](#-task-4-implement-bluegreen-deployment-strategy)
+- [📊 Task 5: Monitoring and Rollback Operations](#-task-5-monitoring-and-rollback-operations)
+- [🚦 Task 6: Advanced Configuration and Best Practices](#-task-6-advanced-configuration-and-best-practices)
+- [🛠️ Troubleshooting Common Issues](#️-troubleshooting-common-issues)
+- [🧹 Cleanup](#-cleanup)
+- [📚 Key Concepts](#-key-concepts)
+- [🏁 Conclusion](#-conclusion)
+
+---
+
+## 🎯 Lab Objectives
+
+By the end of this lab, you will be able to:
+
+| # | Objective |
+|---|-----------|
+| 1 | Understand the concepts of progressive delivery and its benefits |
+| 2 | Install and configure Argo Rollouts on a Kubernetes cluster |
+| 3 | Implement canary deployment strategies using Argo Rollouts |
+| 4 | Deploy applications using blue/green deployment strategy |
+| 5 | Monitor and control progressive deployments |
+| 6 | Rollback deployments when issues are detected |
+
+---
+
+## 📋 Prerequisites
+
+Before starting this lab, you should have:
+
+| Requirement | Details |
+|-------------|---------|
+| ☸️ Kubernetes Concepts | Basic understanding of pods, services, deployments |
+| 📄 YAML | Familiarity with YAML configuration files |
+| 📦 Container Technologies | Basic knowledge of container technologies |
+| 🚦 Deployment Strategies | Understanding of deployment strategies concepts |
+| 🐧 CLI Operations | Experience with command-line interface operations |
+
+---
+
+## 🖥️ Lab Environment Setup
+
+> **📝 Note:** Al Nafi provides Linux-based cloud machines for this lab. Simply click **Start Lab** to access your dedicated Linux machine. The provided machine is bare metal with no pre-installed tools — you will install all required tools during this lab.
+
+---
+
+## 🧩 Task 1: Environment Preparation and Tool Installation
+
+### 🔹 Subtask 1.1: Install Docker
+
+First, we need to install Docker to work with containers.
+
+```bash
+# 🔄 Update the system packages
+sudo apt update
+
+# 🧰 Install required packages
+sudo apt install -y apt-transport-https ca-certificates curl gnupg lsb-release
+
+# 🔑 Add Docker's official GPG key
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+# 📦 Add Docker repository
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# 🔄 Update package index
+sudo apt update
+
+# 🐳 Install Docker
+sudo apt install -y docker-ce docker-ce-cli containerd.io
+
+# 👤 Add current user to docker group
+sudo usermod -aG docker $USER
+
+# ▶️ Start and enable Docker service
+sudo systemctl start docker
+sudo systemctl enable docker
+
+# 🔄 Apply group changes
+newgrp docker
+
+# ✅ Verify Docker installation
+docker --version
+```
+
+### 🔹 Subtask 1.2: Install kubectl
+
+Install the Kubernetes command-line tool.
+
+```bash
+# ⬇️ Download kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+# 🔓 Make kubectl executable
+chmod +x kubectl
+
+# 📂 Move kubectl to PATH
+sudo mv kubectl /usr/local/bin/
+
+# ✅ Verify kubectl installation
+kubectl version --client
+```
+
+### 🔹 Subtask 1.3: Install kind (Kubernetes in Docker)
+
+We'll use kind to create a local Kubernetes cluster.
+
+```bash
+# ⬇️ Download kind
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+
+# 🔓 Make kind executable
+chmod +x ./kind
+
+# 📂 Move kind to PATH
+sudo mv ./kind /usr/local/bin/kind
+
+# ✅ Verify kind installation
+kind version
+```
+
+### 🔹 Subtask 1.4: Create Kubernetes Cluster
+
+Create a local Kubernetes cluster using kind.
+
+```bash
+# 📝 Create a kind cluster configuration file
+cat << EOF > kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"
+  extraPortMappings:
+  - containerPort: 80
+    hostPort: 80
+    protocol: TCP
+  - containerPort: 443
+    hostPort: 443
+    protocol: TCP
+- role: worker
+- role: worker
+EOF
+
+# ▶️ Create the cluster
+kind create cluster --config=kind-config.yaml --name=rollouts-lab
+
+# ✅ Verify cluster is running
+kubectl cluster-info --context kind-rollouts-lab
+
+# 🔍 Check nodes
+kubectl get nodes
+```
+
+---
+
+## ⚙️ Task 2: Install and Configure Argo Rollouts
+
+### 🔹 Subtask 2.1: Install Argo Rollouts Controller
+
+Install the Argo Rollouts controller in your Kubernetes cluster.
+
+```bash
+# 📁 Create namespace for Argo Rollouts
+kubectl create namespace argo-rollouts
+
+# 📥 Install Argo Rollouts
+kubectl apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+
+# ✅ Verify the installation
+kubectl get pods -n argo-rollouts
+
+# ⏳ Wait for pods to be ready
+kubectl wait --for=condition=Ready pods --all -n argo-rollouts --timeout=300s
+```
+
+### 🔹 Subtask 2.2: Install Argo Rollouts kubectl Plugin
+
+Install the kubectl plugin for Argo Rollouts to manage rollouts from the command line.
+
+```bash
+# ⬇️ Download the Argo Rollouts kubectl plugin
+curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+
+# 🔓 Make it executable
+chmod +x ./kubectl-argo-rollouts-linux-amd64
+
+# 📂 Move to PATH
+sudo mv ./kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+# ✅ Verify installation
+kubectl argo rollouts version
+```
+
+---
+
+## 🐤 Task 3: Implement Canary Deployment Strategy
+
+### 🔹 Subtask 3.1: Create Sample Application
+
+Create a simple web application for testing canary deployments.
+
+```bash
+# 📁 Create application namespace
+kubectl create namespace canary-demo
+
+# 📝 Create a sample application deployment using Rollout
+cat << EOF > canary-rollout.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: rollouts-demo
+  namespace: canary-demo
+spec:
+  replicas: 5
+  strategy:
+    canary:
+      steps:
+      - setWeight: 20
+      - pause: {}
+      - setWeight: 40
+      - pause: {duration: 10}
+      - setWeight: 60
+      - pause: {duration: 10}
+      - setWeight: 80
+      - pause: {duration: 10}
+  revisionHistoryLimit: 2
+  selector:
+    matchLabels:
+      app: rollouts-demo
+  template:
+    metadata:
+      labels:
+        app: rollouts-demo
+    spec:
+      containers:
+      - name: rollouts-demo
+        image: argoproj/rollouts-demo:blue
+        ports:
+        - name: http
+          containerPort: 8080
+          protocol: TCP
+        resources:
+          requests:
+            memory: 32Mi
+            cpu: 5m
+EOF
+
+# ▶️ Apply the rollout
+kubectl apply -f canary-rollout.yaml
+
+# 📝 Create service for the application
+cat << EOF > canary-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: rollouts-demo
+  namespace: canary-demo
+spec:
+  ports:
+  - port: 80
+    targetPort: http
+    protocol: TCP
+    name: http
+  selector:
+    app: rollouts-demo
+EOF
+
+# ▶️ Apply the service
+kubectl apply -f canary-service.yaml
+```
+
+### 🔹 Subtask 3.2: Verify Initial Deployment
+
+Check that the initial deployment is working correctly.
+
+```bash
+# 🔍 Check rollout status
+kubectl argo rollouts get rollout rollouts-demo -n canary-demo
+
+# 🔍 Check pods
+kubectl get pods -n canary-demo
+
+# 🔍 Check service
+kubectl get svc -n canary-demo
+
+# 🌐 Port forward to access the application
+kubectl port-forward svc/rollouts-demo 8080:80 -n canary-demo &
+
+# 🌐 Test the application (in a new terminal or background)
+curl http://localhost:8080
+```
+
+### 🔹 Subtask 3.3: Perform Canary Deployment
+
+Now let's update the application to trigger a canary deployment.
+
+```bash
+# 🔄 Update the rollout with a new image
+kubectl argo rollouts set image rollouts-demo rollouts-demo=argoproj/rollouts-demo:yellow -n canary-demo
+
+# 👀 Watch the rollout progress
+kubectl argo rollouts get rollout rollouts-demo -n canary-demo --watch
+
+# 🔍 In another terminal, check the pods during rollout
+kubectl get pods -n canary-demo -w
+```
+
+### 🔹 Subtask 3.4: Control Canary Deployment
+
+Learn how to control the canary deployment process.
+
+```bash
+# ⏸️ The rollout will pause at the first step (20% traffic)
+# Check current status
+kubectl argo rollouts get rollout rollouts-demo -n canary-demo
+
+# ▶️ Promote to next step
+kubectl argo rollouts promote rollouts-demo -n canary-demo
+
+# 🔍 Check status again
+kubectl argo rollouts get rollout rollouts-demo -n canary-demo
+
+# 🔄 Let the automatic progression continue or promote manually
+# To abort the rollout if issues are detected:
+# kubectl argo rollouts abort rollouts-demo -n canary-demo
+
+# ⏳ Wait for rollout to complete
+kubectl argo rollouts get rollout rollouts-demo -n canary-demo --watch
+```
+
+---
+
+## 🔵🟢 Task 4: Implement Blue/Green Deployment Strategy
+
+### 🔹 Subtask 4.1: Create Blue/Green Application
+
+Create a new application using blue/green deployment strategy.
+
+```bash
+# 📁 Create namespace for blue/green demo
+kubectl create namespace bluegreen-demo
+
+# 📝 Create blue/green rollout configuration
+cat << EOF > bluegreen-rollout.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: rollout-bluegreen
+  namespace: bluegreen-demo
+spec:
+  replicas: 2
+  strategy:
+    blueGreen:
+      activeService: rollout-bluegreen-active
+      previewService: rollout-bluegreen-preview
+      autoPromotionEnabled: false
+      scaleDownDelaySeconds: 30
+      prePromotionAnalysis:
+        templates:
+        - templateName: success-rate
+        args:
+        - name: service-name
+          value: rollout-bluegreen-preview.bluegreen-demo.svc.cluster.local
+      postPromotionAnalysis:
+        templates:
+        - templateName: success-rate
+        args:
+        - name: service-name
+          value: rollout-bluegreen-active.bluegreen-demo.svc.cluster.local
+  selector:
+    matchLabels:
+      app: rollout-bluegreen
+  template:
+    metadata:
+      labels:
+        app: rollout-bluegreen
+    spec:
+      containers:
+      - name: rollouts-demo
+        image: argoproj/rollouts-demo:blue
+        ports:
+        - containerPort: 8080
+EOF
+
+# ▶️ Apply the rollout
+kubectl apply -f bluegreen-rollout.yaml
+```
+
+### 🔹 Subtask 4.2: Create Services for Blue/Green
+
+Create the active and preview services required for blue/green deployment.
+
+```bash
+# 📝 Create active service
+cat << EOF > bluegreen-active-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: rollout-bluegreen-active
+  namespace: bluegreen-demo
+spec:
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  selector:
+    app: rollout-bluegreen
+EOF
+
+# 📝 Create preview service
+cat << EOF > bluegreen-preview-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: rollout-bluegreen-preview
+  namespace: bluegreen-demo
+spec:
+  ports:
+  - port: 80
+    targetPort: 8080
+    protocol: TCP
+    name: http
+  selector:
+    app: rollout-bluegreen
+EOF
+
+# ▶️ Apply both services
+kubectl apply -f bluegreen-active-service.yaml
+kubectl apply -f bluegreen-preview-service.yaml
+```
+
+### 🔹 Subtask 4.3: Create Analysis Template
+
+Create an analysis template for automated testing during blue/green deployment.
+
+```bash
+# 📝 Create analysis template
+cat << EOF > analysis-template.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+  namespace: bluegreen-demo
+spec:
+  args:
+  - name: service-name
+  metrics:
+  - name: success-rate
+    interval: 10s
+    count: 3
+    successCondition: result[0] >= 0.95
+    provider:
+      prometheus:
+        address: http://prometheus.default.svc.cluster.local:9090
+        query: |
+          sum(irate(
+            istio_requests_total{reporter="destination",destination_service_name=~"{{args.service-name}}",response_code!~"5.*"}[5m]
+          )) / 
+          sum(irate(
+            istio_requests_total{reporter="destination",destination_service_name=~"{{args.service-name}}"}[5m]
+          ))
+EOF
+
+# 📝 For this lab, we'll create a simplified version without Prometheus
+cat << EOF > simple-analysis-template.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+  namespace: bluegreen-demo
+spec:
+  args:
+  - name: service-name
+  metrics:
+  - name: success-rate
+    interval: 10s
+    count: 2
+    successCondition: "true"
+    provider:
+      job:
+        spec:
+          template:
+            spec:
+              containers:
+              - name: sleep
+                image: alpine:3.8
+                command: [sh, -c]
+                args: ["sleep 10"]
+              restartPolicy: Never
+          backoffLimit: 0
+EOF
+
+# ▶️ Apply the analysis template
+kubectl apply -f simple-analysis-template.yaml
+```
+
+### 🔹 Subtask 4.4: Perform Blue/Green Deployment
+
+Execute a blue/green deployment and observe the process.
+
+```bash
+# 🔍 Check initial status
+kubectl argo rollouts get rollout rollout-bluegreen -n bluegreen-demo
+
+# 🔍 Verify services
+kubectl get svc -n bluegreen-demo
+
+# 🌐 Port forward to active service
+kubectl port-forward svc/rollout-bluegreen-active 8081:80 -n bluegreen-demo &
+
+# 🌐 Test active service
+curl http://localhost:8081
+
+# 🔄 Update the rollout to trigger blue/green deployment
+kubectl argo rollouts set image rollout-bluegreen rollouts-demo=argoproj/rollouts-demo:yellow -n bluegreen-demo
+
+# 👀 Watch the rollout progress
+kubectl argo rollouts get rollout rollout-bluegreen -n bluegreen-demo --watch
+```
+
+### 🔹 Subtask 4.5: Test Preview Environment
+
+Test the preview environment before promoting to active.
+
+```bash
+# 🌐 Port forward to preview service
+kubectl port-forward svc/rollout-bluegreen-preview 8082:80 -n bluegreen-demo &
+
+# 🌐 Test preview service (should show yellow version)
+curl http://localhost:8082
+
+# 🔍 Check rollout status
+kubectl argo rollouts get rollout rollout-bluegreen -n bluegreen-demo
+
+# ▶️ Promote the rollout after testing
+kubectl argo rollouts promote rollout-bluegreen -n bluegreen-demo
+
+# 👀 Watch the promotion process
+kubectl argo rollouts get rollout rollout-bluegreen -n bluegreen-demo --watch
+
+# 🌐 Test active service again (should now show yellow version)
+curl http://localhost:8081
+```
+
+---
+
+## 📊 Task 5: Monitoring and Rollback Operations
+
+### 🔹 Subtask 5.1: Monitor Rollout History
+
+Learn how to monitor rollout history and status.
+
+```bash
+# 📜 Check rollout history for canary deployment
+kubectl argo rollouts history rollouts-demo -n canary-demo
+
+# 📜 Check rollout history for blue/green deployment
+kubectl argo rollouts history rollout-bluegreen -n bluegreen-demo
+
+# 🔍 Get detailed information about a specific revision
+kubectl argo rollouts get rollout rollouts-demo -n canary-demo --revision=1
+
+# 📋 List all rollouts
+kubectl get rollouts --all-namespaces
+```
+
+### 🔹 Subtask 5.2: Perform Rollback Operations
+
+Learn how to rollback deployments when issues are detected.
+
+```bash
+# ⏪ Rollback canary deployment to previous version
+kubectl argo rollouts undo rollouts-demo -n canary-demo
+
+# 👀 Watch the rollback process
+kubectl argo rollouts get rollout rollouts-demo -n canary-demo --watch
+
+# ⏪ Rollback to a specific revision
+kubectl argo rollouts undo rollout-bluegreen --to-revision=1 -n bluegreen-demo
+
+# ✅ Verify rollback
+kubectl argo rollouts get rollout rollout-bluegreen -n bluegreen-demo
+```
+
+### 🔹 Subtask 5.3: Abort In-Progress Deployments
+
+Learn how to abort deployments that are in progress.
+
+```bash
+# 🔄 Start a new deployment
+kubectl argo rollouts set image rollouts-demo rollouts-demo=argoproj/rollouts-demo:red -n canary-demo
+
+# 🔍 Check status
+kubectl argo rollouts get rollout rollouts-demo -n canary-demo
+
+# 🛑 Abort the deployment
+kubectl argo rollouts abort rollouts-demo -n canary-demo
+
+# 🔍 Check status after abort
+kubectl argo rollouts get rollout rollouts-demo -n canary-demo
+
+# ▶️ Resume the aborted deployment if needed
+kubectl argo rollouts promote rollouts-demo -n canary-demo
+```
+
+---
+
+## 🚦 Task 6: Advanced Configuration and Best Practices
+
+### 🔹 Subtask 6.1: Configure Traffic Management
+
+Create advanced traffic management configurations.
+
+```bash
+# 📝 Create a more advanced canary configuration with traffic management
+cat << EOF > advanced-canary.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: advanced-canary
+  namespace: canary-demo
+spec:
+  replicas: 10
+  strategy:
+    canary:
+      maxSurge: "25%"
+      maxUnavailable: 0
+      steps:
+      - setWeight: 10
+      - pause: {duration: 30}
+      - setWeight: 20
+      - pause: {duration: 30}
+      - setWeight: 50
+      - pause: {duration: 60}
+      - setWeight: 80
+      - pause: {duration: 30}
+      canaryService: advanced-canary-preview
+      stableService: advanced-canary-stable
+  selector:
+    matchLabels:
+      app: advanced-canary
+  template:
+    metadata:
+      labels:
+        app: advanced-canary
+    spec:
+      containers:
+      - name: app
+        image: argoproj/rollouts-demo:blue
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            memory: 16Mi
+            cpu: 5m
+          limits:
+            memory: 32Mi
+            cpu: 10m
+EOF
+
+# ▶️ Apply advanced canary configuration
+kubectl apply -f advanced-canary.yaml
+
+# 📝 Create corresponding services
+cat << EOF > advanced-services.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: advanced-canary-stable
+  namespace: canary-demo
+spec:
+  ports:
+  - port: 80
+    targetPort: 8080
+  selector:
+    app: advanced-canary
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: advanced-canary-preview
+  namespace: canary-demo
+spec:
+  ports:
+  - port: 80
+    targetPort: 8080
+  selector:
+    app: advanced-canary
+EOF
+
+kubectl apply -f advanced-services.yaml
+```
+
+### 🔹 Subtask 6.2: Implement Health Checks
+
+Add health checks and readiness probes to your rollouts.
+
+```bash
+# 📝 Create rollout with health checks
+cat << EOF > rollout-with-health.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: rollout-with-health
+  namespace: canary-demo
+spec:
+  replicas: 3
+  strategy:
+    canary:
+      steps:
+      - setWeight: 33
+      - pause: {duration: 10}
+      - setWeight: 66
+      - pause: {duration: 10}
+  selector:
+    matchLabels:
+      app: rollout-with-health
+  template:
+    metadata:
+      labels:
+        app: rollout-with-health
+    spec:
+      containers:
+      - name: app
+        image: argoproj/rollouts-demo:blue
+        ports:
+        - containerPort: 8080
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: 16Mi
+            cpu: 5m
+EOF
+
+kubectl apply -f rollout-with-health.yaml
+```
+
+---
+
+## 🛠️ Troubleshooting Common Issues
+
+<details>
+<summary><strong>❗ Issue 1: Rollout Stuck in Progressing State</strong></summary>
+
+```bash
+# 🔍 Check rollout events
+kubectl describe rollout rollouts-demo -n canary-demo
+
+# 🔍 Check pod status
+kubectl get pods -n canary-demo
+
+# 📄 Check pod logs
+kubectl logs -l app=rollouts-demo -n canary-demo
+
+# ▶️ Force promotion if stuck
+kubectl argo rollouts promote rollouts-demo -n canary-demo --full
+```
+
+</details>
+
+<details>
+<summary><strong>❗ Issue 2: Services Not Routing Traffic Correctly</strong></summary>
+
+```bash
+# 🔍 Check service endpoints
+kubectl get endpoints -n canary-demo
+
+# 🔍 Verify service selectors match pod labels
+kubectl get pods --show-labels -n canary-demo
+
+# 🌐 Test service connectivity
+kubectl run test-pod --image=busybox --rm -it -- wget -qO- http://rollouts-demo.canary-demo.svc.cluster.local
+```
+
+</details>
+
+<details>
+<summary><strong>❗ Issue 3: Analysis Failing</strong></summary>
+
+```bash
+# 🔍 Check analysis runs
+kubectl get analysisruns -n bluegreen-demo
+
+# 🔍 Describe analysis run for details
+kubectl describe analysisrun <analysis-run-name> -n bluegreen-demo
+
+# 🔍 Check analysis template
+kubectl get analysistemplates -n bluegreen-demo
+```
+
+</details>
+
+---
+
+## 🧹 Cleanup
+
+Clean up the lab environment when finished.
+
+```bash
+# 🛑 Stop port forwarding processes
+pkill -f "kubectl port-forward"
+
+# 🗑️ Delete namespaces
+kubectl delete namespace canary-demo
+kubectl delete namespace bluegreen-demo
+kubectl delete namespace argo-rollouts
+
+# 🗑️ Delete kind cluster
+kind delete cluster --name=rollouts-lab
+
+# 🗑️ Remove configuration files
+rm -f kind-config.yaml canary-rollout.yaml canary-service.yaml
+rm -f bluegreen-rollout.yaml bluegreen-active-service.yaml bluegreen-preview-service.yaml
+rm -f simple-analysis-template.yaml advanced-canary.yaml advanced-services.yaml
+rm -f rollout-with-health.yaml
+```
+
+---
+
+## 📚 Key Concepts
+
+| Concept | Description |
+|---------|-------------|
+| **Progressive Delivery** | Gradually exposing a new application version to users while observing its behavior before a full rollout |
+| **Canary Deployment** | Shifting a growing percentage of traffic to a new version in defined steps, pausing between each |
+| **Blue/Green Deployment** | Running two identical environments (active and preview) and switching traffic over only after the new version is validated |
+| **AnalysisTemplate** | A reusable definition of automated success metrics used to gate promotion during a rollout |
+| **Rollout Promotion** | Manually or automatically advancing a paused rollout to its next traffic-weight step |
+| **Rollout Abort/Undo** | Halting an in-progress rollout or reverting to a prior stable revision when issues are detected |
+| **canaryService / stableService** | Services that let a canary rollout split traffic between the new (canary) and current (stable) ReplicaSets |
+
+---
+
+## 🏁 Conclusion
+
+In this comprehensive lab, you have successfully:
+
+### 🏆 Key Accomplishments
+
+- ✅ Installed and configured Argo Rollouts on a Kubernetes cluster, learning how to set up the controller and kubectl plugin for managing progressive deployments
+- ✅ Implemented canary deployment strategies that allow you to gradually roll out new versions of applications while monitoring their performance and health
+- ✅ Deployed applications using blue/green strategy which provides zero-downtime deployments by maintaining two identical production environments
+- ✅ Learned to monitor and control deployments using Argo Rollouts commands and understood how to promote, abort, and rollback deployments based on various conditions
+- ✅ Configured advanced traffic management and health checks to ensure robust and reliable deployment processes
+
+### 🌍 Why This Matters
+
+Progressive delivery strategies like canary and blue/green deployments are essential for modern DevOps practices because they:
+
+- Reduce deployment risk by allowing you to test new versions with a subset of users before full rollout
+- Enable faster recovery from issues through automated rollback mechanisms
+- Improve application reliability by providing controlled deployment processes with built-in safety measures
+- Support continuous delivery practices that are crucial for competitive software development
+- Provide better user experience by minimizing downtime and reducing the impact of potential issues
+
+The skills you've developed in this lab are directly applicable to production environments where safe, controlled, and automated deployment processes are critical for maintaining high-quality software services. Argo Rollouts provides the foundation for implementing sophisticated deployment strategies that balance the need for rapid feature delivery with the requirement for system stability and reliability.
+
+---
+
+<div align="center">
+
+![Al Nafi](https://img.shields.io/badge/Al%20Nafi-Cybersecurity%20Training-orange?style=for-the-badge)
+
+</div>
