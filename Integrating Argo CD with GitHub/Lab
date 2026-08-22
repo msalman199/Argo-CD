@@ -1,0 +1,387 @@
+ Integrating Argo CD with GitHub
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Install and configure Argo CD on a Linux machine
+Connect Argo CD to a GitHub repository for GitOps workflows
+Deploy a sample application from a GitHub repository using Argo CD
+Understand the GitOps deployment model and its benefits
+Monitor and manage application deployments through the Argo CD web interface
+Troubleshoot common integration issues between Argo CD and GitHub
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Kubernetes concepts (pods, services, deployments)
+Familiarity with Git and GitHub operations
+Basic knowledge of YAML file structure
+Understanding of containerized applications
+Experience with Linux command line operations
+A GitHub account (free account is sufficient)
+Lab Environment
+Al Nafi Cloud Machine: This lab uses a Linux-based cloud machine provided by Al Nafi. Simply click Start Lab to access your dedicated environment. The provided Linux machine is bare metal with no pre-installed tools, so you will install all required components during the lab.
+
+System Requirements: The lab runs entirely on a single Linux machine with all tools and services configured locally.
+
+Task 1: Setting Up the Environment
+Subtask 1.1: Install Required Dependencies
+First, update your system and install essential tools:
+
+# Update system packages
+sudo apt update && sudo apt upgrade -y
+
+# Install curl, wget, and other utilities
+sudo apt install -y curl wget git vim unzip
+
+# Install Docker
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+sudo usermod -aG docker $USER
+newgrp docker
+
+# Verify Docker installation
+docker --version
+Subtask 1.2: Install kubectl
+Install the Kubernetes command-line tool:
+
+# Download kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+# Make kubectl executable
+chmod +x kubectl
+
+# Move kubectl to PATH
+sudo mv kubectl /usr/local/bin/
+
+# Verify installation
+kubectl version --client
+Subtask 1.3: Install and Start Minikube
+Set up a local Kubernetes cluster:
+
+# Download Minikube
+curl -LO https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64
+
+# Install Minikube
+sudo install minikube-linux-amd64 /usr/local/bin/minikube
+
+# Start Minikube cluster
+minikube start --driver=docker --memory=4096 --cpus=2
+
+# Verify cluster is running
+kubectl cluster-info
+kubectl get nodes
+Subtask 1.4: Install Argo CD
+Deploy Argo CD in your Kubernetes cluster:
+
+# Create Argo CD namespace
+kubectl create namespace argocd
+
+# Install Argo CD
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Wait for Argo CD pods to be ready
+kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
+
+# Verify Argo CD installation
+kubectl get pods -n argocd
+Subtask 1.5: Access Argo CD Web Interface
+Configure access to the Argo CD web interface:
+
+# Get the initial admin password
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d && echo
+
+# Port forward to access Argo CD UI (run in background)
+kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+
+# Install Argo CD CLI
+curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+rm argocd-linux-amd64
+
+# Login to Argo CD CLI
+argocd login localhost:8080 --username admin --password $(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d) --insecure
+Note: Save the admin password displayed above for accessing the web interface.
+
+Task 2: Connecting Argo CD to GitHub
+Subtask 2.1: Create a GitHub Repository
+Create a sample repository for this lab:
+
+# Create a local directory for your application
+mkdir ~/argocd-demo-app
+cd ~/argocd-demo-app
+
+# Initialize Git repository
+git init
+
+# Create a simple application manifest
+cat > deployment.yaml << 'EOF'
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-app
+  labels:
+    app: demo-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: demo-app
+  template:
+    metadata:
+      labels:
+        app: demo-app
+    spec:
+      containers:
+      - name: demo-app
+        image: nginx:1.21
+        ports:
+        - containerPort: 80
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: demo-app-service
+spec:
+  selector:
+    app: demo-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+  type: ClusterIP
+EOF
+
+# Create application configuration
+cat > application.yaml << 'EOF'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: demo-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/YOUR_USERNAME/argocd-demo-app.git
+    targetRevision: HEAD
+    path: .
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+EOF
+
+# Add files to Git
+git add .
+git commit -m "Initial commit: Add demo application manifests"
+Manual Step:
+
+Go to GitHub.com and create a new repository named argocd-demo-app
+Make it public
+Copy the repository URL
+# Replace YOUR_USERNAME with your actual GitHub username
+git remote add origin https://github.com/YOUR_USERNAME/argocd-demo-app.git
+
+# Update the application.yaml with your actual repository URL
+sed -i 's/YOUR_USERNAME/your-actual-username/g' application.yaml
+
+# Push to GitHub
+git branch -M main
+git push -u origin main
+Subtask 2.2: Configure Repository Access in Argo CD
+Add your GitHub repository to Argo CD:
+
+# Add repository to Argo CD (replace with your repository URL)
+argocd repo add https://github.com/YOUR_USERNAME/argocd-demo-app.git
+
+# Verify repository is added
+argocd repo list
+For private repositories, you would need to add credentials:
+
+# For private repositories (optional)
+# argocd repo add https://github.com/YOUR_USERNAME/argocd-demo-app.git --username YOUR_USERNAME --password YOUR_TOKEN
+Subtask 2.3: Verify Repository Connection
+Check that Argo CD can access your repository:
+
+# Test repository connection
+argocd repo get https://github.com/YOUR_USERNAME/argocd-demo-app.git
+
+# Check repository status
+kubectl get secrets -n argocd | grep repo
+Task 3: Deploy Sample Application from GitHub Repository
+Subtask 3.1: Create Argo CD Application
+Deploy your application using Argo CD:
+
+# Create application from your GitHub repository
+argocd app create demo-app \
+  --repo https://github.com/YOUR_USERNAME/argocd-demo-app.git \
+  --path . \
+  --dest-server https://kubernetes.default.svc \
+  --dest-namespace default \
+  --sync-policy automated \
+  --auto-prune \
+  --self-heal
+
+# Verify application creation
+argocd app list
+Subtask 3.2: Sync and Deploy Application
+Synchronize your application with the repository:
+
+# Sync the application
+argocd app sync demo-app
+
+# Check application status
+argocd app get demo-app
+
+# Watch the deployment
+kubectl get pods -w
+Subtask 3.3: Verify Deployment
+Confirm that your application is running correctly:
+
+# Check deployed resources
+kubectl get deployments
+kubectl get services
+kubectl get pods
+
+# Check application logs
+kubectl logs -l app=demo-app
+
+# Test the application
+kubectl port-forward svc/demo-app-service 8081:80 &
+curl http://localhost:8081
+Subtask 3.4: Access Argo CD Web Interface
+View your deployment in the Argo CD web interface:
+
+Open a web browser
+Navigate to https://localhost:8080
+Login with username: admin and the password you saved earlier
+Click on the demo-app application to view its status
+Task 4: Testing GitOps Workflow
+Subtask 4.1: Modify Application Configuration
+Test the GitOps workflow by making changes:
+
+# Navigate to your local repository
+cd ~/argocd-demo-app
+
+# Modify the deployment to use 3 replicas
+sed -i 's/replicas: 2/replicas: 3/g' deployment.yaml
+
+# Commit and push changes
+git add deployment.yaml
+git commit -m "Scale application to 3 replicas"
+git push origin main
+Subtask 4.2: Observe Automatic Synchronization
+Watch Argo CD automatically sync the changes:
+
+# Watch for changes in pods
+kubectl get pods -l app=demo-app -w
+
+# Check application status
+argocd app get demo-app
+
+# Verify 3 replicas are running
+kubectl get deployment demo-app
+Subtask 4.3: Test Application Rollback
+Demonstrate rollback capabilities:
+
+# View application history
+argocd app history demo-app
+
+# Rollback to previous version (if needed)
+# argocd app rollback demo-app 1
+
+# Check current status
+argocd app get demo-app --show-params
+Task 5: Monitoring and Management
+Subtask 5.1: Monitor Application Health
+Check application health and sync status:
+
+# Get detailed application information
+argocd app get demo-app
+
+# Check sync status
+argocd app wait demo-app --health
+
+# View application events
+kubectl get events --sort-by=.metadata.creationTimestamp
+Subtask 5.2: Configure Notifications (Optional)
+Set up basic monitoring:
+
+# Check Argo CD server logs
+kubectl logs -n argocd deployment/argocd-server
+
+# Monitor application controller logs
+kubectl logs -n argocd deployment/argocd-application-controller
+Subtask 5.3: Clean Up Resources
+Clean up the lab environment:
+
+# Delete the application
+argocd app delete demo-app --cascade
+
+# Verify cleanup
+kubectl get all
+
+# Stop port forwarding processes
+pkill -f "kubectl port-forward"
+Troubleshooting Common Issues
+Issue 1: Repository Connection Failed
+Problem: Argo CD cannot connect to GitHub repository
+
+Solution:
+
+# Check repository URL is correct
+argocd repo list
+
+# Test manual git clone
+git clone https://github.com/YOUR_USERNAME/argocd-demo-app.git /tmp/test-repo
+
+# Check network connectivity
+curl -I https://github.com
+Issue 2: Application Sync Failed
+Problem: Application fails to sync
+
+Solution:
+
+# Check application logs
+argocd app logs demo-app
+
+# Force refresh
+argocd app get demo-app --refresh
+
+# Manual sync
+argocd app sync demo-app --force
+Issue 3: Pods Not Starting
+Problem: Application pods are not starting
+
+Solution:
+
+# Check pod status
+kubectl describe pods -l app=demo-app
+
+# Check resource constraints
+kubectl top nodes
+kubectl top pods
+
+# Check events
+kubectl get events --field-selector involvedObject.name=demo-app
+Key Concepts Summary
+GitOps: A deployment methodology that uses Git repositories as the single source of truth for infrastructure and application configuration.
+
+Argo CD: A declarative, GitOps continuous delivery tool for Kubernetes that automatically syncs applications with their Git repository state.
+
+Continuous Deployment: The practice of automatically deploying code changes to production after they pass automated tests.
+
+Declarative Configuration: Describing the desired state of your system rather than the steps to achieve it.
+
+Conclusion
+In this lab, you successfully:
+
+Installed and configured Argo CD on a local Kubernetes cluster
+Connected Argo CD to a GitHub repository for GitOps workflows
+Deployed a sample application using declarative configuration
+Tested the automatic synchronization between Git and your Kubernetes cluster
+Learned to monitor and manage applications through Argo CD
+This integration between Argo CD and GitHub enables a powerful GitOps workflow where your Git repository becomes the single source of truth for your application deployments. Any changes pushed to your repository are automatically reflected in your Kubernetes cluster, providing a reliable, auditable, and scalable deployment process.
+
+The skills you've learned in this lab form the foundation for implementing GitOps practices in production environments, enabling teams to deploy applications more reliably and with better visibility into the deployment process.
