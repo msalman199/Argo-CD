@@ -1,0 +1,71 @@
+Managing Secrets with Argo CD
+Objectives
+Design and deploy a GitOps-managed application on Kubernetes where all sensitive credentials are sourced from HashiCorp Vault rather than stored in Git
+Implement the External Secrets Operator to automate synchronization between Vault and Kubernetes Secrets, with a measurable rotation cycle
+Validate end-to-end secret lifecycle: provisioning, rotation, and pod-level consumption, all reconciled through Argo CD
+Prerequisites
+Comfort with Linux command-line operations including file editing, process management, and reading logs
+Conceptual understanding of Kubernetes objects (Deployments, Services, Namespaces, Secrets) and basic Git workflows
+Lab Environment
+You will work on a dedicated AWS EC2 Ubuntu instance provided by Al Nafi. The instance has a base Ubuntu installation; you will install all required tools in Task 1.
+
+Task 1: Install and Verify the Full Toolchain
+Requirement 1.1
+Install every tool the lab depends on â Docker, kubectl, kind (Kubernetes-in-Docker), the Argo CD CLI, the Vault CLI, and Helm â then create a single-node kind cluster and deploy Argo CD into it. Each tool must be installed from its official distribution channel; you must verify the installed version of every tool before proceeding.
+
+Acceptance Criteria
+
+Running docker version, kubectl version --client, kind version, argocd version --client, vault version, and helm version each exit with code 0 and print a recognisable version string; any tool that fails this check means the requirement is not met.
+kubectl get pods -n argocd shows every Argo CD pod in Running state with all containers ready before you leave this task.
+Troubleshoot this step â Docker installation:
+
+Error seen: E: Package 'docker-ce' has no installation candidate after adding the Docker apt repository.
+Recovery: Confirm the repository file contains a single unbroken line with no literal backslashes by running cat /etc/apt/sources.list.d/docker.list, then re-run sudo apt-get update before retrying.
+Official guide: https://docs.docker.com/engine/install/ubuntu/
+Troubleshoot this step â kind cluster creation:
+
+Error seen: ERROR: failed to create cluster: failed to get kubeconfig: command "docker inspect ..." failed or the kind binary silently exits non-zero.
+Recovery: Confirm your user is in the docker group with groups $USER; if not, run sudo usermod -aG docker $USER, then open a new shell session and retry.
+Official guide: https://kind.sigs.k8s.io/docs/user/quick-start/
+Troubleshoot this step â Argo CD deployment:
+
+Error seen: Pods stuck in Pending or ImagePullBackOff after applying the install manifest.
+Recovery: Run kubectl describe pod -n argocd <pod-name> to read the exact event; for ImagePullBackOff confirm the kind node has internet access with docker exec <kind-container> curl -fsSL https://quay.io.
+Official guide: https://argo-cd.readthedocs.io/en/stable/getting_started/
+Requirement 1.2
+Deploy HashiCorp Vault in development mode as a pod inside the kind cluster (not as an external process) using the official Vault Helm chart, then initialise it, unseal it, enable the KV-v2 secrets engine at the path secret/, and confirm the Vault UI is reachable via kubectl port-forward.
+
+Acceptance Criteria
+
+vault status (executed with VAULT_ADDR pointing at the forwarded port) returns Sealed: false and Initialized: true.
+vault kv put secret/smoke-test value=ok followed immediately by vault kv get secret/smoke-test prints value: ok, confirming the KV-v2 engine is functional.
+Troubleshoot this step â Vault Helm install:
+
+Error seen: Error: INSTALLATION FAILED: chart requires kubeVersion: >= 1.x.x or no matches for kind "PodDisruptionBudget".
+Recovery: Run kubectl version to confirm the server version, then pin the Vault chart to a compatible version with helm search repo hashicorp/vault --versions and pass --version <compatible> to helm install.
+Official guide: https://developer.hashicorp.com/vault/docs/platform/k8s/helm
+Task 2: Store Secrets in Vault and Synchronise Them into Kubernetes via External Secrets Operator
+Requirement 2.1
+Design and implement a complete secret-provisioning pipeline: write three application secrets into Vault under the path secret/demo-app/ (database credentials, an API key, and a JWT signing key), install the External Secrets Operator (ESO) into the cluster using its official Helm chart, create a SecretStore that authenticates to Vault using the Kubernetes auth method bound to a dedicated ServiceAccount, and define one ExternalSecret resource per secret group that materialises each Vault secret as a native Kubernetes Secret in the demo-app namespace. The refreshInterval on every ExternalSecret must be set to 60s.
+
+Acceptance Criteria
+
+kubectl get externalsecret -n demo-app shows all three ExternalSecret objects with READY: True and STATUS: SecretSynced; any object showing SecretSyncError means the requirement is not met.
+Each of the three materialised Kubernetes Secrets contains the exact key-value pairs written to Vault, verifiable by base64-decoding the secret data with kubectl get secret <name> -n demo-app -o jsonpath='{.data.<key>}' | base64 -d.
+Troubleshoot this step â ESO SecretStore authentication failure:
+
+Error seen: ExternalSecret status shows SecretSyncError: could not get provider client: error initializing Vault client: ... 403 permission denied.
+Recovery: Confirm the Vault Kubernetes auth role lists the correct ServiceAccount name and namespace with vault read auth/kubernetes/role/demo-app; also confirm the policy attached to the role grants read on secret/data/demo-app/*.
+Official guide: https://external-secrets.io/latest/provider/hashicorp-vault/
+Requirement 2.2
+Create an Argo CD Application resource (using a local Git repository initialised on the EC2 instance as the source) that manages a Deployment in the demo-app namespace. The Deployment must consume all three Kubernetes Secrets produced by ESO â two as environment variables and one as a volume mount at /etc/secrets/jwt. The Argo CD application must be configured for automated sync with self-heal enabled. After the initial sync, simulate a secret rotation by updating the API key value in Vault, wait for ESO to refresh, then perform a rolling restart of the Deployment and confirm the pod reads the new value.
+
+Acceptance Criteria
+
+kubectl get application demo-app -n argocd -o jsonpath='{.status.sync.status}' returns Synced and kubectl get application demo-app -n argocd -o jsonpath='{.status.health.status}' returns Healthy simultaneously, with no manual argocd app sync invocation required after the initial kubectl apply of the Application manifest.
+After rotating the API key in Vault and restarting the Deployment, kubectl exec -n demo-app <pod> -- env | grep API_KEY prints the rotated value, not the original one; the pod must reach Running state within 120 seconds of the restart command.
+Expected Outcomes
+A fully operational GitOps pipeline in which application secrets never appear in Git, are stored exclusively in Vault, and are delivered to pods automatically by the External Secrets Operator under Argo CD reconciliation.
+Demonstrated secret rotation: a value changed in Vault propagates to a running pod within the ESO refresh window plus a rolling restart, with the new value confirmed at the process level inside the container.
+Conclusion
+This lab required you to integrate three distinct systems â HashiCorp Vault, the External Secrets Operator, and Argo CD â into a coherent secrets management pipeline without any prescribed implementation path. The core principle you exercised is that Git should contain only intent (what secrets are needed and where), never the secret values themselves, with an external system of record (Vault) as the single source of truth. Extending this pattern to production means adding Vault HA, audit logging, and automated lease renewal, all of which follow directly from the architecture you built here.
