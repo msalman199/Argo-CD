@@ -1,0 +1,314 @@
+Application Health Monitoring with Argo CD
+Objectives
+Design and deploy a Lua-based custom health check system in Argo CD that evaluates Deployment, Service, and ConfigMap resources beyond default status conditions
+Implement a webhook-driven notification pipeline that fires on health state transitions and delivers structured payloads to a receiver service running inside the cluster
+Validate end-to-end observability by injecting deliberate failures, confirming degraded state detection, and verifying recovery propagation through the notification chain
+Prerequisites
+Comfort with Linux command-line operations including file editing, process management, and reading structured log output
+Conceptual understanding of Kubernetes primitives (Pods, Deployments, Services, ConfigMaps) and how controllers reconcile desired versus actual state
+Familiarity with Git repository operations sufficient to commit changes and observe downstream sync behavior
+Lab Environment
+You will work on a dedicated AWS EC2 Ubuntu instance provided by Al Nafi. The instance has a base Ubuntu installation; you will install all required tools in Task 1.
+
+Task 1: Environment Setup and Tool Verification
+Step 1.1: Install Container Runtime, Cluster Tooling, and Argo CD CLI
+Your goal is a functional single-node Kubernetes cluster reachable via kubectl, with Argo CD deployed into its own namespace and the argocd CLI authenticated against it.
+
+Install the following in order: Docker Engine, kubectl (matching the Kubernetes version your cluster will run), kind (Kubernetes-in-Docker â a tool that runs a full Kubernetes control plane inside Docker containers), and the Argo CD CLI binary. After each group, confirm the binary is on PATH and returns a version string.
+
+# 1. System prerequisites
+sudo apt-get update -y
+sudo apt-get install -y curl wget git jq
+
+# 2. Docker Engine
+# Official guide if the URL below changes: https://docs.docker.com/engine/install/ubuntu/
+curl -fsSL https://get.docker.com | sudo sh
+sudo usermod -aG docker "$USER"
+newgrp docker
+docker version
+Troubleshoot this step:
+
+Error seen: Cannot connect to the Docker daemon at unix:///var/run/docker.sock
+Recovery: Run sudo systemctl start docker && sudo systemctl enable docker, then re-run docker version
+Docs: https://docs.docker.com/engine/install/ubuntu/
+# 3. kubectl
+# Official guide if the URL below changes: https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/
+KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o kubectl
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+rm kubectl
+kubectl version --client
+Troubleshoot this step:
+
+Error seen: curl: (22) The requested URL returned error: 404
+Recovery: Verify the stable version string with curl -fsSL https://dl.k8s.io/release/stable.txt and substitute it manually into the download URL
+Docs: https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/
+# 4. kind
+# Official guide if the URL below changes: https://kind.sigs.k8s.io/docs/user/quick-start/
+curl -fsSL https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64 -o kind
+sudo install -o root -g root -m 0755 kind /usr/local/bin/kind
+rm kind
+kind version
+Troubleshoot this step:
+
+Error seen: kind: command not found after install
+Recovery: Confirm /usr/local/bin is in your PATH with echo $PATH; if not, run export PATH=$PATH:/usr/local/bin and add it to ~/.bashrc
+Docs: https://kind.sigs.k8s.io/docs/user/quick-start/
+# 5. Argo CD CLI
+# Official guide if the URL below changes: https://argo-cd.readthedocs.io/en/stable/cli_installation/
+ARGOCD_VERSION=$(curl -fsSL https://api.github.com/repos/argoproj/argo-cd/releases/latest | jq -r '.tag_name')
+curl -fsSL "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64" -o argocd
+sudo install -o root -g root -m 0755 argocd /usr/local/bin/argocd
+rm argocd
+argocd version --client
+Troubleshoot this step:
+
+Error seen: jq: command not found or empty ARGOCD_VERSION
+Recovery: Confirm jq installed with which jq; if the GitHub API rate-limits you, set the version manually: ARGOCD_VERSION=v2.11.3
+Docs: https://argo-cd.readthedocs.io/en/stable/cli_installation/
+Step 1.2: Bootstrap the Kubernetes Cluster and Deploy Argo CD
+Create a kind cluster named argocd-lab, deploy Argo CD into the argocd namespace using the upstream stable manifest, wait until all Argo CD Deployments report Available, then authenticate the CLI.
+
+# Create cluster
+kind create cluster --name argocd-lab
+kubectl cluster-info --context kind-argocd-lab
+
+# Deploy Argo CD
+# Official manifest source: https://argo-cd.readthedocs.io/en/stable/getting_started/
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Wait for all Argo CD deployments to become available (timeout 5 minutes)
+kubectl wait deployment \
+  argocd-server \
+  argocd-repo-server \
+  argocd-applicationset-controller \
+  argocd-dex-server \
+  -n argocd \
+  --for=condition=Available \
+  --timeout=300s
+
+kubectl get pods -n argocd
+Troubleshoot this step:
+
+Error seen: error: timed out waiting for the condition on deployments/argocd-server
+Recovery: Run kubectl describe pod -n argocd -l app.kubernetes.io/name=argocd-server and look for image pull errors or resource pressure; on a small instance, increase timeout to 600s
+Docs: https://argo-cd.readthedocs.io/en/stable/getting_started/
+# Expose Argo CD API server and authenticate CLI
+kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+sleep 5
+
+ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 --decode)
+
+argocd login localhost:8080 \
+  --username admin \
+  --password "$ARGOCD_PASSWORD" \
+  --insecure
+
+argocd account get-user-info
+Confirmation: argocd account get-user-info returns Logged In: true and Username: admin.
+
+Task 2: Custom Health Checks and Application Deployment
+Step 2.1: Author Lua Health Check Logic and Register It with Argo CD
+Argo CD evaluates resource health using Lua scripts stored in the argocd-cm ConfigMap. Each script receives the live Kubernetes object as obj and must return a table with status (one of Healthy, Progressing, Degraded, Missing, Suspended) and message.
+
+Your health check contract for each resource type is:
+
+-- Interface contract: every health script must satisfy this shape.
+-- Input:  obj  (table) â the full live Kubernetes resource object
+-- Output: hs   (table) â must contain exactly these two string fields
+
+hs = {}
+hs.status  = ""   -- one of: "Healthy" | "Progressing" | "Degraded" | "Missing" | "Suspended"
+hs.message = ""   -- human-readable explanation shown in the Argo CD UI
+return hs
+Implement three scripts satisfying the following behavioral contracts:
+
+apps_Deployment
+
+Healthy when readyReplicas == replicas and replicas > 0
+Degraded when readyReplicas == 0 and the Deployment has existed for more than its progressDeadlineSeconds
+Progressing in all other transient states
+Message must include numeric replica counts in all branches
+v1_Service
+
+Healthy for ClusterIP and NodePort types unconditionally (these have no external provisioning step)
+Progressing for LoadBalancer type until status.loadBalancer.ingress is non-nil and non-empty
+Healthy for LoadBalancer once ingress is populated, with the first ingress IP or hostname in the message
+v1_ConfigMap
+
+Healthy always; message must report the count of keys in obj.data
+Register all three scripts by patching argocd-cm, then restart argocd-server and argocd-application-controller to apply the change. Confirm the restart completes cleanly.
+
+# Patch argocd-cm with your Lua scripts.
+# Replace the placeholder values below with your actual Lua implementations.
+# The key naming convention is: resource.customizations.health.<group>_<Kind>
+# where group "v1" maps to core API resources and "apps" maps to apps/v1.
+
+kubectl patch configmap argocd-cm -n argocd --type merge --patch '
+{
+  "data": {
+    "resource.customizations.health.apps_Deployment": "REPLACE_WITH_YOUR_LUA_SCRIPT",
+    "resource.customizations.health.v1_Service":      "REPLACE_WITH_YOUR_LUA_SCRIPT",
+    "resource.customizations.health.v1_ConfigMap":    "REPLACE_WITH_YOUR_LUA_SCRIPT"
+  }
+}'
+
+kubectl rollout restart deployment/argocd-server deployment/argocd-application-controller -n argocd
+kubectl rollout status deployment/argocd-server -n argocd --timeout=120s
+kubectl rollout status deployment/argocd-application-controller -n argocd --timeout=120s
+Confirmation: kubectl get configmap argocd-cm -n argocd -o jsonpath='{.data}' | jq 'keys' lists all three resource.customizations.health.* keys.
+
+Step 2.2: Create a Git-Backed Application and Register It with Argo CD
+Argo CD is a GitOps controller â it continuously reconciles cluster state against a Git repository. You will create a local bare Git repository (simulating a remote) containing Kubernetes manifests, then register it as an Argo CD Application.
+
+Your application must include at minimum:
+
+A Namespace manifest for health-demo
+A Deployment of two replicas running nginx:1.25 with liveness and readiness probes on port 80
+A ClusterIP Service selecting the Deployment pods
+A ConfigMap with at least three data keys
+Constraints:
+
+The Argo CD Application must use syncPolicy.automated with selfHeal: true so that manual cluster edits are reverted automatically
+CreateNamespace=true must be set in syncOptions so Argo CD creates the namespace if absent
+The repoURL must point to the local bare repository path using the file:// scheme
+# Scaffold â fill in the manifest content yourself
+mkdir -p ~/argocd-health-demo/manifests
+cd ~/argocd-health-demo
+
+git init
+git config user.name "Lab User"
+git config user.email "lab@example.com"
+
+# Create your manifests under manifests/ then:
+git add .
+git commit -m "feat: initial application manifests"
+
+# Create bare repo to act as the remote
+git clone --bare ~/argocd-health-demo ~/argocd-health-demo.git
+
+# Register the repo with Argo CD (no credentials needed for local file:// repos)
+argocd repo add "file://${HOME}/argocd-health-demo.git"
+
+# Create and apply your Application manifest, then verify
+argocd app list
+argocd app get health-demo-app
+Confirmation: argocd app get health-demo-app shows Health Status: Healthy and Sync Status: Synced within two minutes of application creation.
+
+Task 3: Notification Pipeline, Failure Injection, and Recovery Validation
+Step 3.1: Deploy a Webhook Receiver and Wire Argo CD Notifications
+Argo CD Notifications (a controller that watches Application objects and fires messages on state transitions) must be installed separately from core Argo CD. You will install it, configure a webhook service endpoint as the notification target, and subscribe the application to three triggers.
+
+Your webhook receiver must satisfy this interface â implement it in any language or framework you choose:
+
+class WebhookReceiver:
+    def handle_post(self, headers: dict, body: bytes) -> tuple[int, str]:
+        """
+        Accept an HTTP POST from Argo CD Notifications.
+
+        Parameters
+        ----------
+        headers : dict
+            HTTP request headers; expect Content-Type: application/json
+        body : bytes
+            Raw JSON payload from Argo CD Notifications template
+
+        Returns
+        -------
+        tuple[int, str]
+            HTTP status code (200 on success) and response body string.
+            Must append a timestamped record to a persistent log file at
+            /tmp/webhook-alerts.log before returning.
+        """
+        ...
+Architectural constraints:
+
+The receiver must run as a Kubernetes Deployment of one replica in the default namespace
+It must be reachable at http://webhook-receiver.default.svc.cluster.local:9000/notify
+It must not require authentication (this is a lab environment)
+Configure argocd-notifications-cm with:
+
+A template named app-health-change that includes app.metadata.name, app.status.health.status, and app.status.sync.status in the payload
+Three triggers: on-health-degraded (fires when health is Degraded), on-sync-succeeded (fires when sync is Synced), on-sync-failed (fires when sync is OutOfSync)
+A webhook service definition pointing to your receiver URL
+# Install Argo CD Notifications controller
+# Official guide: https://argo-cd.readthedocs.io/en/stable/operator-manual/notifications/
+kubectl apply -n argocd \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/notifications_install/install.yaml
+
+kubectl wait deployment/argocd-notifications-controller \
+  -n argocd \
+  --for=condition=Available \
+  --timeout=120s
+Troubleshoot this step:
+
+Error seen: unable to recognize URL: no matches for kind "NotificationsController"
+Recovery: The notifications manifest URL changes between Argo CD releases; fetch the correct URL from the release page at https://github.com/argoproj/argo-cd/releases and look for notifications_install.yaml
+Docs: https://argo-cd.readthedocs.io/en/stable/operator-manual/notifications/
+After deploying the receiver and applying argocd-notifications-cm, annotate the application to subscribe it to all three triggers:
+
+# Annotation format: notifications.argoproj.io/subscribe.<trigger-name>.<service-type>: <service-name>
+# Apply all three annotations in a single patch to avoid race conditions.
+kubectl patch application health-demo-app -n argocd --type merge --patch '
+{
+  "metadata": {
+    "annotations": {
+      "notifications.argoproj.io/subscribe.on-health-degraded.webhook":  "health-webhook",
+      "notifications.argoproj.io/subscribe.on-sync-succeeded.webhook":   "health-webhook",
+      "notifications.argoproj.io/subscribe.on-sync-failed.webhook":      "health-webhook"
+    }
+  }
+}'
+Confirmation: kubectl logs -n argocd deployment/argocd-notifications-controller --tail=20 shows no failed to send errors after the application reaches Synced.
+
+Step 3.2: Inject Failures, Validate Detection, and Confirm Recovery
+This step validates the entire pipeline end-to-end. You will introduce two categories of failure, observe that Argo CD detects them and fires notifications, then restore the application and confirm recovery propagation.
+
+Failure scenario A â bad image tag: Update the Deployment manifest in your working repository to use nginx:this-tag-does-not-exist, commit the change, push it to the bare repository, and force an Argo CD sync. The Deployment will enter ImagePullBackOff, which your Lua health check must classify as Degraded.
+
+Failure scenario B â replica starvation: After reverting the image, update the Deployment to request cpu: 8000m per container (more than any node can provide). Pods will remain Pending indefinitely. Your health check must classify this as Degraded as well.
+
+For each scenario, confirm all three of the following before reverting:
+
+# 1. Argo CD reports Degraded
+argocd app get health-demo-app --output json | jq '.status.health'
+
+# 2. Individual resource health reflects the failure
+kubectl get application health-demo-app -n argocd \
+  -o jsonpath='{range .status.resources[*]}{.kind}/{.name}: {.health.status} - {.health.message}{"\n"}{end}'
+
+# 3. Webhook receiver logged the notification
+kubectl exec deployment/webhook-receiver -- cat /tmp/webhook-alerts.log | tail -10
+After confirming detection for both scenarios, restore the Deployment to nginx:1.25 with cpu: 250m, commit, push, and sync. Confirm the application returns to Healthy and that the on-sync-succeeded trigger fires a notification visible in the receiver log.
+
+Confirmation: The receiver log at /tmp/webhook-alerts.log contains at minimum three timestamped entries â one Degraded entry per failure scenario and one Synced entry after recovery.
+
+Code Contracts Reference
+-- Lua health script return contract (all three scripts must conform)
+-- hs.status  : string  â exactly one of the five valid Argo CD health states
+-- hs.message : string  â non-empty, human-readable, includes numeric context where applicable
+hs = {}
+hs.status  = ""
+hs.message = ""
+return hs
+# Notification payload shape your template must produce (JSON-serializable)
+class NotificationPayload:
+    app_name:    str   # application metadata name
+    health:      str   # current health status string
+    sync:        str   # current sync status string
+    timestamp:   str   # ISO-8601 UTC timestamp
+# Webhook receiver interface
+class WebhookReceiver:
+    def handle_post(self, headers: dict, body: bytes) -> tuple[int, str]: ...
+Expected Outcomes
+The Argo CD UI and CLI both reflect accurate, resource-level health states driven by your Lua scripts, with messages that distinguish between Progressing, Degraded, and Healthy conditions for each resource type
+The webhook receiver log contains timestamped, structured entries for every health state transition triggered during failure injection and recovery, confirming the full notification pipeline is operational
+Troubleshooting
+If your Lua health script is syntactically valid but Argo CD continues showing the default health status rather than your custom evaluation, what mechanism would you use to confirm that the argocd-cm patch was actually read by the application controller after its restart, and how would you distinguish a configuration-load failure from a logic error in the script itself?
+
+If the webhook receiver pod is running and its Service exists, but the Argo CD Notifications controller logs show repeated connection refused errors to your receiver URL, what sequence of in-cluster network diagnostics would you perform to isolate whether the problem is DNS resolution, Service selector mismatch, or the receiver process not binding to the expected address and port?
+
+Conclusion
+This lab demonstrated how Argo CD's Lua-based health evaluation layer can be extended beyond built-in defaults to encode application-specific correctness criteria, and how the Notifications controller transforms those health state transitions into actionable signals delivered to external systems. The failure injection scenarios established that the pipeline detects real degradation conditions â not just configuration correctness â and that recovery is propagated through the same channel without manual intervention. These patterns form the operational foundation for GitOps workflows where automated health feedback replaces manual cluster inspection.
