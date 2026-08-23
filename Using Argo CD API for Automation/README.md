@@ -1,0 +1,760 @@
+<div align="center">
+
+# 🔌 Using Argo CD API for Automation
+
+![Argo CD](https://img.shields.io/badge/Argo_CD-EF7B4D?style=for-the-badge&logo=argo&logoColor=white)
+![Kubernetes](https://img.shields.io/badge/Kubernetes-326CE5?style=for-the-badge&logo=kubernetes&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?style=for-the-badge&logo=docker&logoColor=white)
+![REST API](https://img.shields.io/badge/REST_API-009688?style=for-the-badge&logo=fastapi&logoColor=white)
+![Bash](https://img.shields.io/badge/Bash-4EAA25?style=for-the-badge&logo=gnubash&logoColor=white)
+![GitOps](https://img.shields.io/badge/GitOps-000000?style=for-the-badge&logo=git&logoColor=white)
+
+**A hands-on lab for automating Argo CD deployments and rollbacks via its REST API**
+
+</div>
+
+---
+
+## 📖 Table of Contents
+
+- [🎯 Learning Objectives](#-learning-objectives)
+- [📋 Prerequisites](#-prerequisites)
+- [🖥️ Lab Environment](#️-lab-environment)
+- [🔐 Task 1: Set Up Authentication for Argo CD API](#-task-1-set-up-authentication-for-argo-cd-api)
+- [🔄 Task 2: Automate Deployments and Rollbacks via API](#-task-2-automate-deployments-and-rollbacks-via-api)
+- [🛠️ Troubleshooting Tips](#️-troubleshooting-tips)
+- [📚 Key Concepts](#-key-concepts)
+- [✅ Conclusion](#-conclusion)
+
+---
+
+## 🎯 Learning Objectives
+
+By the end of this lab, you will be able to:
+
+| # | Objective |
+|---|-----------|
+| 1 | Set up and configure authentication for Argo CD API access |
+| 2 | Use the Argo CD REST API to automate application deployments |
+| 3 | Perform automated rollbacks using API calls |
+| 4 | Create scripts to manage Argo CD applications programmatically |
+| 5 | Understand API endpoints and authentication mechanisms for Argo CD |
+
+## 📋 Prerequisites
+
+Before starting this lab, you should have:
+
+| # | Requirement |
+|---|-------------|
+| 1 | Basic understanding of Kubernetes concepts (pods, services, deployments) |
+| 2 | Familiarity with REST APIs and HTTP methods |
+| 3 | Basic knowledge of JSON format and command-line tools |
+| 4 | Understanding of Git repositories and version control |
+| 5 | Experience with Linux command line operations |
+
+## 🖥️ Lab Environment
+
+> Al Nafi provides Linux-based cloud machines for this lab. Simply click **Start Lab** to access your dedicated environment. The provided Linux machine is bare metal with no pre-installed tools — you will install all required components during the lab exercises.
+
+---
+
+## 🔐 Task 1: Set Up Authentication for Argo CD API
+
+### 📦 Subtask 1.1: Install Required Tools
+
+Install Docker, kubectl, and other essential tools on the Linux machine.
+
+```bash
+# 🔄 Update system packages
+sudo apt update && sudo apt upgrade -y
+
+# 🐳 Install Docker
+sudo apt install -y docker.io
+sudo systemctl start docker
+sudo systemctl enable docker
+sudo usermod -aG docker $USER
+
+# ☸️ Install kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+
+# 🎡 Install kind (Kubernetes in Docker)
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+chmod +x ./kind
+sudo mv ./kind /usr/local/bin/kind
+
+# 🔧 Install curl and jq for API interactions
+sudo apt install -y curl jq
+
+# 🔁 Logout and login again to apply docker group changes
+newgrp docker
+```
+
+### ☸️ Subtask 1.2: Create Kubernetes Cluster
+
+Create a local Kubernetes cluster using `kind`.
+
+```bash
+# 📝 Create kind cluster configuration
+cat <<EOF > kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"
+  extraPortMappings:
+  - containerPort: 80
+    hostPort: 8080
+    protocol: TCP
+  - containerPort: 443
+    hostPort: 8443
+    protocol: TCP
+EOF
+
+# 🚀 Create the cluster
+kind create cluster --config=kind-config.yaml --name argocd-lab
+
+# ✅ Verify cluster is running
+kubectl cluster-info
+kubectl get nodes
+```
+
+### 🚀 Subtask 1.3: Install Argo CD
+
+Install Argo CD into the Kubernetes cluster.
+
+```bash
+# 📁 Create argocd namespace
+kubectl create namespace argocd
+
+# 📥 Install Argo CD
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# ⏳ Wait for Argo CD pods to be ready
+kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
+
+# ✅ Verify installation
+kubectl get pods -n argocd
+```
+
+### 🌐 Subtask 1.4: Access Argo CD Server
+
+Set up access to the Argo CD server.
+
+```bash
+# 🌐 Port forward to access Argo CD server
+kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+
+# 🔑 Get the initial admin password
+ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+echo "Argo CD Admin Password: $ARGOCD_PASSWORD"
+
+# 💾 Save credentials for later use
+echo "admin" > argocd-username.txt
+echo "$ARGOCD_PASSWORD" > argocd-password.txt
+```
+
+### 💻 Subtask 1.5: Install Argo CD CLI
+
+Install the Argo CD CLI tool.
+
+```bash
+# ⬇️ Download and install Argo CD CLI
+curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+rm argocd-linux-amd64
+
+# ✅ Verify installation
+argocd version --client
+```
+
+### 🔑 Subtask 1.6: Configure API Authentication
+
+Set up authentication for API access.
+
+```bash
+# 🔐 Login to Argo CD using CLI (this will also test our setup)
+argocd login localhost:8080 --username admin --password "$ARGOCD_PASSWORD" --insecure
+
+# 🎫 Get authentication token for API calls
+AUTH_TOKEN=$(argocd account generate-token --account admin)
+echo "Authentication Token: $AUTH_TOKEN"
+
+# 💾 Save token for API calls
+echo "$AUTH_TOKEN" > argocd-token.txt
+
+# 🧪 Test API authentication
+curl -k -H "Authorization: Bearer $AUTH_TOKEN" https://localhost:8080/api/v1/session/userinfo | jq
+```
+
+---
+
+## 🔄 Task 2: Automate Deployments and Rollbacks via API
+
+### 📁 Subtask 2.1: Create Sample Application Repository
+
+Create a sample application for deployment automation.
+
+```bash
+# 📂 Create a local git repository for our sample app
+mkdir sample-app
+cd sample-app
+
+# 🌱 Initialize git repository
+git init
+git config user.name "Lab User"
+git config user.email "lab@example.com"
+
+# 📝 Create sample Kubernetes manifests
+mkdir k8s-manifests
+
+cat <<EOF > k8s-manifests/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+  labels:
+    app: sample-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sample-app
+  template:
+    metadata:
+      labels:
+        app: sample-app
+    spec:
+      containers:
+      - name: sample-app
+        image: nginx:1.20
+        ports:
+        - containerPort: 80
+        env:
+        - name: VERSION
+          value: "v1.0"
+EOF
+
+cat <<EOF > k8s-manifests/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app-service
+spec:
+  selector:
+    app: sample-app
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 80
+  type: ClusterIP
+EOF
+
+# ✅ Commit initial version
+git add .
+git commit -m "Initial version v1.0"
+
+# 🔼 Create a second version for rollback testing
+sed -i 's/nginx:1.20/nginx:1.21/g' k8s-manifests/deployment.yaml
+sed -i 's/v1.0/v2.0/g' k8s-manifests/deployment.yaml
+git add .
+git commit -m "Update to version v2.0"
+
+# ⬅️ Go back to lab root directory
+cd ..
+```
+
+### ➕ Subtask 2.2: Create Application via API
+
+Create an Argo CD application using the REST API.
+
+```json
+{
+  "metadata": {
+    "name": "sample-app-api",
+    "namespace": "argocd"
+  },
+  "spec": {
+    "project": "default",
+    "source": {
+      "repoURL": "file://$(pwd)/sample-app",
+      "targetRevision": "HEAD",
+      "path": "k8s-manifests"
+    },
+    "destination": {
+      "server": "https://kubernetes.default.svc",
+      "namespace": "default"
+    },
+    "syncPolicy": {
+      "automated": {
+        "prune": true,
+        "selfHeal": true
+      }
+    }
+  }
+}
+```
+
+```bash
+# ➕ Create application via API
+curl -k -X POST \
+  -H "Authorization: Bearer $(cat argocd-token.txt)" \
+  -H "Content-Type: application/json" \
+  -d @create-app.json \
+  https://localhost:8080/api/v1/applications | jq
+
+# ✅ Verify application creation
+curl -k -H "Authorization: Bearer $(cat argocd-token.txt)" \
+  https://localhost:8080/api/v1/applications/sample-app-api | jq '.metadata.name, .status.sync.status'
+```
+
+### 📜 Subtask 2.3: Create Deployment Automation Script
+
+Create a script to automate deployments.
+
+```bash
+cat <<EOF > deploy-app.sh
+#!/bin/bash
+
+# ⚙️ Configuration
+ARGOCD_SERVER="https://localhost:8080"
+TOKEN=\$(cat argocd-token.txt)
+APP_NAME="sample-app-api"
+
+# 📊 Function to get application status
+get_app_status() {
+    curl -s -k -H "Authorization: Bearer \$TOKEN" \
+        "\$ARGOCD_SERVER/api/v1/applications/\$APP_NAME" | jq -r '.status.sync.status'
+}
+
+# 💓 Function to get application health
+get_app_health() {
+    curl -s -k -H "Authorization: Bearer \$TOKEN" \
+        "\$ARGOCD_SERVER/api/v1/applications/\$APP_NAME" | jq -r '.status.health.status'
+}
+
+# 🔄 Function to sync application
+sync_app() {
+    echo "Triggering sync for application: \$APP_NAME"
+    
+    curl -s -k -X POST \
+        -H "Authorization: Bearer \$TOKEN" \
+        -H "Content-Type: application/json" \
+        -d '{"prune": true, "dryRun": false}' \
+        "\$ARGOCD_SERVER/api/v1/applications/\$APP_NAME/sync" | jq
+}
+
+# ⏳ Function to wait for sync completion
+wait_for_sync() {
+    echo "Waiting for sync to complete..."
+    
+    while true; do
+        STATUS=\$(get_app_status)
+        HEALTH=\$(get_app_health)
+        
+        echo "Current status: \$STATUS, Health: \$HEALTH"
+        
+        if [[ "\$STATUS" == "Synced" && "\$HEALTH" == "Healthy" ]]; then
+            echo "Application successfully synced and healthy!"
+            break
+        elif [[ "\$STATUS" == "Unknown" || "\$HEALTH" == "Degraded" ]]; then
+            echo "Application sync failed or unhealthy"
+            exit 1
+        fi
+        
+        sleep 5
+    done
+}
+
+# 🚀 Main deployment process
+echo "Starting automated deployment..."
+echo "Current application status: \$(get_app_status)"
+
+# 🔄 Trigger sync
+sync_app
+
+# ⏳ Wait for completion
+wait_for_sync
+
+echo "Deployment completed successfully!"
+EOF
+
+# 🔓 Make script executable
+chmod +x deploy-app.sh
+
+# ▶️ Run the deployment script
+./deploy-app.sh
+```
+
+### ✅ Subtask 2.4: Verify Deployment
+
+Verify that the application was deployed successfully.
+
+```bash
+# 📊 Check application status via API
+curl -k -H "Authorization: Bearer $(cat argocd-token.txt)" \
+  https://localhost:8080/api/v1/applications/sample-app-api | jq '.status'
+
+# 🔍 Check deployed resources in Kubernetes
+kubectl get deployments -n default
+kubectl get pods -n default
+kubectl get services -n default
+
+# 📋 Get application details
+kubectl describe deployment sample-app -n default
+```
+
+### ⏪ Subtask 2.5: Create Rollback Automation Script
+
+Create a script to automate rollbacks.
+
+```bash
+cat <<EOF > rollback-app.sh
+#!/bin/bash
+
+# ⚙️ Configuration
+ARGOCD_SERVER="https://localhost:8080"
+TOKEN=\$(cat argocd-token.txt)
+APP_NAME="sample-app-api"
+
+# 📜 Function to get application history
+get_app_history() {
+    curl -s -k -H "Authorization: Bearer \$TOKEN" \
+        "\$ARGOCD_SERVER/api/v1/applications/\$APP_NAME/revisions" | jq
+}
+
+# ⏪ Function to rollback to specific revision
+rollback_to_revision() {
+    local revision=\$1
+    
+    echo "Rolling back application \$APP_NAME to revision \$revision"
+    
+    curl -s -k -X POST \
+        -H "Authorization: Bearer \$TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"revision\": \"\$revision\", \"prune\": true, \"dryRun\": false}" \
+        "\$ARGOCD_SERVER/api/v1/applications/\$APP_NAME/rollback" | jq
+}
+
+# 🔖 Function to get current revision
+get_current_revision() {
+    curl -s -k -H "Authorization: Bearer \$TOKEN" \
+        "\$ARGOCD_SERVER/api/v1/applications/\$APP_NAME" | jq -r '.status.sync.revision'
+}
+
+# ⏳ Function to wait for rollback completion
+wait_for_rollback() {
+    echo "Waiting for rollback to complete..."
+    
+    while true; do
+        STATUS=\$(curl -s -k -H "Authorization: Bearer \$TOKEN" \
+            "\$ARGOCD_SERVER/api/v1/applications/\$APP_NAME" | jq -r '.status.sync.status')
+        HEALTH=\$(curl -s -k -H "Authorization: Bearer \$TOKEN" \
+            "\$ARGOCD_SERVER/api/v1/applications/\$APP_NAME" | jq -r '.status.health.status')
+        
+        echo "Current status: \$STATUS, Health: \$HEALTH"
+        
+        if [[ "\$STATUS" == "Synced" && "\$HEALTH" == "Healthy" ]]; then
+            echo "Rollback completed successfully!"
+            break
+        elif [[ "\$STATUS" == "Unknown" || "\$HEALTH" == "Degraded" ]]; then
+            echo "Rollback failed or application unhealthy"
+            exit 1
+        fi
+        
+        sleep 5
+    done
+}
+
+# 🚀 Main rollback process
+echo "Starting automated rollback..."
+
+# 🔖 Get current revision
+CURRENT_REV=\$(get_current_revision)
+echo "Current revision: \$CURRENT_REV"
+
+# 📜 Get application history
+echo "Application history:"
+get_app_history
+
+# ⏪ For this demo, we'll rollback to the previous commit
+# In a real scenario, you would specify the target revision
+cd sample-app
+PREVIOUS_REV=\$(git rev-parse HEAD~1)
+cd ..
+
+echo "Rolling back to revision: \$PREVIOUS_REV"
+
+# ▶️ Perform rollback
+rollback_to_revision "\$PREVIOUS_REV"
+
+# ⏳ Wait for completion
+wait_for_rollback
+
+echo "Rollback completed successfully!"
+EOF
+
+# 🔓 Make script executable
+chmod +x rollback-app.sh
+```
+
+### 🧪 Subtask 2.6: Test Rollback Functionality
+
+Test the rollback automation end-to-end.
+
+```bash
+# 🔼 First, let's update our application to create a new version
+cd sample-app
+
+# 🆕 Create version 3.0
+sed -i 's/nginx:1.21/nginx:1.22/g' k8s-manifests/deployment.yaml
+sed -i 's/v2.0/v3.0/g' k8s-manifests/deployment.yaml
+git add .
+git commit -m "Update to version v3.0"
+
+cd ..
+
+# ▶️ Deploy the new version
+./deploy-app.sh
+
+# ✅ Verify the new deployment
+kubectl get deployment sample-app -o jsonpath='{.spec.template.spec.containers[0].image}'
+echo
+
+# ⏪ Now test the rollback
+./rollback-app.sh
+
+# ✅ Verify rollback worked
+kubectl get deployment sample-app -o jsonpath='{.spec.template.spec.containers[0].image}'
+echo
+```
+
+### 🛠️ Subtask 2.7: Create Comprehensive API Management Script
+
+Create a comprehensive script for managing applications via API.
+
+```bash
+cat <<EOF > argocd-api-manager.sh
+#!/bin/bash
+
+# ⚙️ Configuration
+ARGOCD_SERVER="https://localhost:8080"
+TOKEN=\$(cat argocd-token.txt)
+
+# 📋 Function to list all applications
+list_applications() {
+    echo "Listing all applications:"
+    curl -s -k -H "Authorization: Bearer \$TOKEN" \
+        "\$ARGOCD_SERVER/api/v1/applications" | jq '.items[] | {name: .metadata.name, status: .status.sync.status, health: .status.health.status}'
+}
+
+# 🔍 Function to get application details
+get_application() {
+    local app_name=\$1
+    echo "Getting details for application: \$app_name"
+    curl -s -k -H "Authorization: Bearer \$TOKEN" \
+        "\$ARGOCD_SERVER/api/v1/applications/\$app_name" | jq
+}
+
+# 🗑️ Function to delete application
+delete_application() {
+    local app_name=\$1
+    echo "Deleting application: \$app_name"
+    curl -s -k -X DELETE \
+        -H "Authorization: Bearer \$TOKEN" \
+        "\$ARGOCD_SERVER/api/v1/applications/\$app_name?cascade=true" | jq
+}
+
+# 🔃 Function to refresh application
+refresh_application() {
+    local app_name=\$1
+    echo "Refreshing application: \$app_name"
+    curl -s -k -X POST \
+        -H "Authorization: Bearer \$TOKEN" \
+        "\$ARGOCD_SERVER/api/v1/applications/\$app_name/refresh" | jq
+}
+
+# 📄 Function to get application logs
+get_application_logs() {
+    local app_name=\$1
+    echo "Getting logs for application: \$app_name"
+    curl -s -k -H "Authorization: Bearer \$TOKEN" \
+        "\$ARGOCD_SERVER/api/v1/applications/\$app_name/logs" | jq
+}
+
+# 📌 Main menu
+case "\$1" in
+    "list")
+        list_applications
+        ;;
+    "get")
+        if [ -z "\$2" ]; then
+            echo "Usage: \$0 get <app-name>"
+            exit 1
+        fi
+        get_application "\$2"
+        ;;
+    "delete")
+        if [ -z "\$2" ]; then
+            echo "Usage: \$0 delete <app-name>"
+            exit 1
+        fi
+        delete_application "\$2"
+        ;;
+    "refresh")
+        if [ -z "\$2" ]; then
+            echo "Usage: \$0 refresh <app-name>"
+            exit 1
+        fi
+        refresh_application "\$2"
+        ;;
+    "logs")
+        if [ -z "\$2" ]; then
+            echo "Usage: \$0 logs <app-name>"
+            exit 1
+        fi
+        get_application_logs "\$2"
+        ;;
+    *)
+        echo "Usage: \$0 {list|get|delete|refresh|logs} [app-name]"
+        echo "Commands:"
+        echo "  list                 - List all applications"
+        echo "  get <app-name>       - Get application details"
+        echo "  delete <app-name>    - Delete application"
+        echo "  refresh <app-name>   - Refresh application"
+        echo "  logs <app-name>      - Get application logs"
+        exit 1
+        ;;
+esac
+EOF
+
+# 🔓 Make script executable
+chmod +x argocd-api-manager.sh
+
+# 🧪 Test the management script
+echo "Testing API management script:"
+./argocd-api-manager.sh list
+```
+
+### 🔍 Subtask 2.8: Verify All API Operations
+
+Test all the API operations created in this lab.
+
+```bash
+# 📋 List applications
+echo "=== Listing Applications ==="
+./argocd-api-manager.sh list
+
+# 🔍 Get application details
+echo -e "\n=== Application Details ==="
+./argocd-api-manager.sh get sample-app-api
+
+# 🔃 Refresh application
+echo -e "\n=== Refreshing Application ==="
+./argocd-api-manager.sh refresh sample-app-api
+
+# ✅ Check final status
+echo -e "\n=== Final Status Check ==="
+curl -k -H "Authorization: Bearer $(cat argocd-token.txt)" \
+  https://localhost:8080/api/v1/applications/sample-app-api | jq '.status.sync.status, .status.health.status'
+
+# ☸️ Verify Kubernetes resources
+echo -e "\n=== Kubernetes Resources ==="
+kubectl get all -n default -l app=sample-app
+```
+
+---
+
+## 🛠️ Troubleshooting Tips
+
+<details>
+<summary><strong>Click to expand common issues and solutions</strong></summary>
+
+#### Issue 1: Authentication Token Expired
+
+```bash
+# 🔑 Generate new token
+argocd login localhost:8080 --username admin --password "$(cat argocd-password.txt)" --insecure
+AUTH_TOKEN=$(argocd account generate-token --account admin)
+echo "$AUTH_TOKEN" > argocd-token.txt
+```
+
+#### Issue 2: Port Forward Connection Lost
+
+```bash
+# 🔁 Kill existing port forward and restart
+pkill -f "kubectl port-forward"
+kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+```
+
+#### Issue 3: Application Sync Issues
+
+```bash
+# 🔍 Check application events
+curl -k -H "Authorization: Bearer $(cat argocd-token.txt)" \
+  https://localhost:8080/api/v1/applications/sample-app-api/events | jq
+
+# 🔄 Force refresh and sync
+curl -k -X POST -H "Authorization: Bearer $(cat argocd-token.txt)" \
+  https://localhost:8080/api/v1/applications/sample-app-api/refresh
+
+curl -k -X POST -H "Authorization: Bearer $(cat argocd-token.txt)" \
+  -H "Content-Type: application/json" \
+  -d '{"prune": true, "dryRun": false}' \
+  https://localhost:8080/api/v1/applications/sample-app-api/sync
+```
+
+#### Issue 4: Git Repository Access
+
+```bash
+# 📂 Ensure git repository is accessible
+cd sample-app
+git status
+git log --oneline
+cd ..
+```
+
+</details>
+
+---
+
+## 📚 Key Concepts
+
+| Concept | Description |
+|---------|-------------|
+| **Argo CD API Authentication** | Uses bearer tokens for API access, which can be generated using the CLI or obtained through login endpoints |
+| **Application Management** | Applications can be created, updated, synced, and deleted through REST API endpoints with JSON payloads |
+| **Automation Benefits** | API automation enables integration with CI/CD pipelines, monitoring systems, and custom deployment workflows |
+| **Rollback Capabilities** | Argo CD maintains revision history and supports automated rollbacks to previous application states |
+| **Monitoring and Status** | The API provides comprehensive status information including sync status, health status, and application events |
+
+---
+
+## ✅ Conclusion
+
+In this lab, you have successfully:
+
+- ✅ Set up Argo CD with API authentication using bearer tokens
+- ✅ Created automated deployment scripts using the Argo CD REST API
+- ✅ Implemented rollback automation for application management
+- ✅ Built comprehensive API management tools for Argo CD operations
+- ✅ Learned to integrate Argo CD API calls into shell scripts for automation
+
+### 🌍 Real-World Applications
+
+This automation capability is crucial for modern DevOps practices, enabling seamless integration of GitOps workflows with existing CI/CD pipelines. The API-driven approach allows for programmatic control of deployments, making it possible to build sophisticated deployment automation systems that can respond to various triggers and conditions.
+
+The skills developed in this lab form the foundation for building enterprise-grade deployment automation systems that can scale across multiple applications and environments while maintaining the reliability and auditability that GitOps principles provide.
+
+---
+
+<div align="center">
+
+![Al Nafi](https://img.shields.io/badge/Al_Nafi-Cybersecurity_Training-blue?style=for-the-badge)
+
+</div>
