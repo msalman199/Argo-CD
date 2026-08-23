@@ -1,0 +1,190 @@
+Optimizing Argo CD Performance
+Objectives
+Design and deploy a production-grade Argo CD installation on a local Kubernetes cluster with Redis caching tuned for throughput
+Implement and validate sync policy optimizations including server-side apply, resource exclusions, and sync waves across multiple applications
+Measure and compare synchronization performance between baseline and optimized Argo CD configurations using scripted benchmarks
+Prerequisites
+Comfort with Ubuntu command-line operations including file editing, process management, and reading command output
+Conceptual understanding of Kubernetes objects (Deployments, Services, ConfigMaps) and GitOps principles
+Lab Environment
+You will work on a dedicated AWS EC2 Ubuntu instance provided by Al Nafi. The instance has a base Ubuntu installation; you will install all required tools in Task 1.
+
+Task 1: Install and Verify the Full Toolchain
+Requirement 1
+Design an installation procedure that produces a working local Kubernetes cluster running inside Docker on your EC2 instance. Your procedure must install Docker, kubectl, kind (Kubernetes-in-Docker), the Helm package manager, the Argo CD CLI, and supporting utilities (git, curl, wget, jq, bc) from their official sources. Every tool must be reachable on PATH for all subsequent tasks.
+
+sudo apt-get update && sudo apt-get upgrade -y
+sudo apt-get install -y git curl wget jq bc apt-transport-https ca-certificates gnupg lsb-release
+sudo apt-get install -y docker.io
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+newgrp docker
+docker version
+Troubleshoot this step:
+
+Error seen: "permission denied while trying to connect to the Docker daemon socket"
+Recovery: Run groups to confirm docker appears; if not, log out and back in, or run newgrp docker again.
+Official guide: https://docs.docker.com/engine/install/ubuntu/
+KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" -o kubectl
+sudo install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl
+rm kubectl
+kubectl version --client
+Troubleshoot this step:
+
+Error seen: "curl: (22) The requested URL returned error: 404" or a binary that prints HTML instead of a version string.
+Recovery: Verify the stable version string with curl -fsSL https://dl.k8s.io/release/stable.txt; if the URL pattern has changed, consult the official page below.
+Official guide: https://kubernetes.io/docs/tasks/tools/install-kubectl-linux/
+curl -fsSL https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64 -o kind
+sudo install -o root -g root -m 0755 kind /usr/local/bin/kind
+rm kind
+kind version
+Troubleshoot this step:
+
+Error seen: "kind: command not found" after install, or "exec format error" when running kind.
+Recovery: Confirm the binary landed in PATH with which kind; if the v0.23.0 URL is stale, find the current release at the page below.
+Official guide: https://kind.sigs.k8s.io/docs/user/quick-start/#installation
+curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 -o get-helm.sh
+chmod +x get-helm.sh
+./get-helm.sh
+rm get-helm.sh
+helm version
+Troubleshoot this step:
+
+Error seen: "Failed to fetch https://get.helm.sh/..." or a non-zero exit from the installer script.
+Recovery: Download the specific release tarball manually from https://github.com/helm/helm/releases and extract the binary to /usr/local/bin/helm.
+Official guide: https://helm.sh/docs/intro/install/
+ARGOCD_VERSION=$(curl -fsSL https://api.github.com/repos/argoproj/argo-cd/releases/latest | jq -r .tag_name)
+curl -fsSL "https://github.com/argoproj/argo-cd/releases/download/${ARGOCD_VERSION}/argocd-linux-amd64" -o argocd
+sudo install -o root -g root -m 0755 argocd /usr/local/bin/argocd
+rm argocd
+argocd version --client
+Troubleshoot this step:
+
+Error seen: "jq: command not found" or the GitHub API returns a rate-limit JSON instead of a version string.
+Recovery: Confirm jq installed with which jq; if rate-limited, hard-code a known version such as v2.11.0 in place of the variable.
+Official guide: https://argo-cd.readthedocs.io/en/stable/cli_installation/
+Requirement 2
+Create a kind cluster named argocd-perf using a configuration that exposes host ports 80, 443, and 30080, then install Argo CD into a dedicated namespace and confirm every Argo CD Deployment reaches the Available condition before proceeding.
+
+cat > kind-config.yaml <<EOF
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"
+  extraPortMappings:
+  - containerPort: 80
+    hostPort: 80
+    protocol: TCP
+  - containerPort: 443
+    hostPort: 443
+    protocol: TCP
+  - containerPort: 30080
+    hostPort: 30080
+    protocol: TCP
+EOF
+
+kind create cluster --config=kind-config.yaml --name argocd-perf
+kubectl cluster-info --context kind-argocd-perf
+kubectl get nodes
+kubectl create namespace argocd
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+Note: If the URL above is unreachable, find the current stable manifest at https://argo-cd.readthedocs.io/en/stable/getting_started/
+
+kubectl wait --for=condition=available --timeout=300s \
+  deployment/argocd-server \
+  deployment/argocd-repo-server \
+  deployment/argocd-application-controller \
+  -n argocd
+
+kubectl get deployments -n argocd
+kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+sleep 8
+ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d)
+argocd login localhost:8080 --username admin --password "${ARGOCD_PASSWORD}" --insecure
+argocd version
+Acceptance criteria:
+
+kubectl get deployments -n argocd shows all Argo CD Deployments with READY equal to their desired replica count and AVAILABLE greater than zero.
+argocd version prints both client and server version strings without error, confirming CLI-to-server connectivity.
+Task 2: Configure Redis Caching and Application Controller Tuning
+Requirement 1
+Design and apply a Redis cache configuration that sets a 256 MB memory ceiling with an LRU eviction policy, then patch the Argo CD application controller to use 20 status processors, 10 operation processors, server-side diff, and a 1-hour resource cache expiration. Both components must restart cleanly and reflect the new settings.
+
+Your solution must produce:
+
+A ConfigMap that the Redis pod mounts and reads as its active configuration
+A second ConfigMap named argocd-cmd-params-cm in the argocd namespace containing the controller tuning keys
+A rollout restart of both argocd-redis and argocd-application-controller that completes without error
+Verify Redis accepted the memory settings:
+
+kubectl exec -n argocd deployment/argocd-redis -- redis-cli CONFIG GET maxmemory
+kubectl exec -n argocd deployment/argocd-redis -- redis-cli CONFIG GET maxmemory-policy
+kubectl exec -n argocd deployment/argocd-redis -- redis-cli INFO memory | grep used_memory_human
+Verify the controller ConfigMap is present:
+
+kubectl get configmap argocd-cmd-params-cm -n argocd -o yaml
+kubectl rollout status deployment/argocd-application-controller -n argocd
+Requirement 2
+Configure the Argo CD repository server with a 24-hour Git cache expiration and a 1 GiB emptyDir cache volume, then update the main argocd-cm ConfigMap to exclude coordination.k8s.io/Lease resources from tracking across all clusters and set the reconciliation timeout to 180 seconds. Apply all changes and confirm the repository server pod restarts successfully.
+
+Your solution must produce:
+
+A patched or replaced argocd-cm ConfigMap containing resource.exclusions, timeout.reconciliation, and application.diff.server.side keys
+A patched argocd-repo-server Deployment that mounts the cache volume and sets the ARGOCD_REPO_CACHE_EXPIRATION environment variable to 24h
+Evidence in repository server logs that the server started without fatal errors after the restart
+Verify the ConfigMap contents and server health:
+
+kubectl get configmap argocd-cm -n argocd -o jsonpath='{.data.resource\.exclusions}'
+kubectl get configmap argocd-cm -n argocd -o jsonpath='{.data.timeout\.reconciliation}'
+kubectl rollout status deployment/argocd-repo-server -n argocd
+kubectl logs -n argocd deployment/argocd-repo-server --tail=30 | grep -iE "(started|error|fatal)"
+Acceptance criteria:
+
+redis-cli CONFIG GET maxmemory returns 268435456 (256 MB in bytes) and redis-cli CONFIG GET maxmemory-policy returns allkeys-lru, confirming Redis is operating under the tuned policy.
+kubectl get configmap argocd-cm -n argocd -o jsonpath='{.data.timeout\.reconciliation}' prints 180s and kubectl rollout status deployment/argocd-repo-server -n argocd exits 0, confirming both the exclusion policy and the repo server restart succeeded.
+Task 3: Deploy Multi-Application Workloads with Optimized Sync Policies and Benchmark Results
+Requirement 1
+Design and deploy three Argo CD Application manifests that demonstrate distinct sync optimization strategies. Each application must point to a local Git repository you initialize on the EC2 instance containing valid Kubernetes manifests. The three strategies to implement are:
+
+Application A: fully automated sync with ApplyOutOfSyncOnly=true, ServerSideApply=true, pruning enabled, self-heal enabled, and a retry backoff capped at 3 minutes
+Application B: manual sync with ServerSideApply=true and RespectIgnoreDifferences=true, ignoring drift on /spec/replicas for Deployments, and a revisionHistoryLimit of 3
+Application C: automated sync using sync waves so that a ConfigMap deploys in wave 0, a Service in wave 1, and a Deployment in wave 2, with ApplyOutOfSyncOnly=true and a retry limit of 3
+All three applications must reach Synced and Healthy status. Use file:// repository URLs pointing to directories under /tmp that you populate and git init yourself.
+
+Verify all three applications are healthy:
+
+argocd app list
+kubectl get applications -n argocd -o custom-columns=\
+"NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status"
+Requirement 2
+Write a shell benchmark script that accepts an application name and an iteration count as positional arguments, triggers an argocd app sync for each iteration, measures wall-clock duration per sync using date +%s%N, and prints the per-iteration duration, the count of successful versus failed syncs, and the arithmetic mean duration across successful syncs. Run the script against Application A (optimized) and a fourth baseline Application you create with no sync options and a revisionHistoryLimit of 10, each for five iterations. Produce a summary that shows both average times and the percentage difference between them.
+
+Your solution must produce:
+
+A script file named benchmark-sync.sh that is executable and produces structured output readable without additional tools
+A file named comparison-summary.txt written by your script or a wrapper that contains the average sync time for both applications and the computed percentage difference
+Evidence that Application C deployed its resources in wave order by showing the creation timestamps of the ConfigMap, Service, and Deployment in the sync-waves-demo namespace
+Verify wave ordering and benchmark output:
+
+kubectl get configmap,service,deployment -n sync-waves-demo \
+  -o custom-columns="KIND:.kind,NAME:.metadata.name,CREATED:.metadata.creationTimestamp" \
+  --sort-by=.metadata.creationTimestamp
+
+cat comparison-summary.txt
+Acceptance criteria:
+
+kubectl get applications -n argocd -o custom-columns="NAME:.metadata.name,SYNC:.status.sync.status,HEALTH:.status.health.status" shows all four applications (A, B, C, and baseline) with SYNC=Synced and HEALTH=Healthy, and the wave-ordered resource list shows ConfigMap creation timestamp earlier than Service, which is earlier than Deployment.
+cat comparison-summary.txt displays a non-zero average sync time for both the optimized and baseline applications and a computed percentage difference value, confirming the benchmark ran to completion and captured measurable timing data for both configurations.
+Expected Outcomes
+A running Argo CD installation with Redis memory limits, LRU eviction, server-side diff, resource exclusions, and a 24-hour repository cache all active simultaneously
+Quantified sync timing data in comparison-summary.txt demonstrating the effect of sync policy optimizations relative to a no-option baseline
+Conclusion
+This lab required you to reason about every layer of Argo CD performance independently: cache storage, controller concurrency, API server load reduction through server-side apply and resource exclusions, and deployment ordering through sync waves. The benchmark you built is a reusable diagnostic tool; run it whenever you change controller parameters to confirm whether a change helps or regresses throughput. Carry the habit of measuring before and after every infrastructure tuning change into production work.
