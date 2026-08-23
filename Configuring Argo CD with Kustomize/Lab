@@ -1,0 +1,826 @@
+Configuring Argo CD with Kustomize
+Lab Objectives
+By the end of this lab, you will be able to:
+
+Install and configure Argo CD on a Kubernetes cluster
+Understand the fundamentals of Kustomize for Kubernetes configuration management
+Create Kustomize overlays for different environments
+Deploy applications using Kustomize with Argo CD
+Manage application configurations through GitOps workflows
+Troubleshoot common Argo CD and Kustomize integration issues
+Prerequisites
+Before starting this lab, you should have:
+
+Basic understanding of Kubernetes concepts (pods, services, deployments)
+Familiarity with YAML syntax and structure
+Basic knowledge of Git version control
+Understanding of containerization concepts
+Experience with command-line interface operations
+Lab Environment
+Al Nafi provides Linux-based cloud machines for this lab. Simply click Start Lab to access your dedicated environment. The provided Linux machine is bare metal with no pre-installed tools, so you will install all required tools during the lab exercises.
+
+Task 1: Set up Kustomize in Kubernetes
+Subtask 1.1: Install Required Tools
+First, we need to install Docker, kubectl, kind (Kubernetes in Docker), and other essential tools.
+
+Install Docker
+# Update package index
+sudo apt update
+
+# Install required packages
+sudo apt install -y apt-transport-https ca-certificates curl gnupg lsb-release
+
+# Add Docker's official GPG key
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+# Set up Docker repository
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Update package index again
+sudo apt update
+
+# Install Docker
+sudo apt install -y docker-ce docker-ce-cli containerd.io
+
+# Add current user to docker group
+sudo usermod -aG docker $USER
+
+# Start and enable Docker service
+sudo systemctl start docker
+sudo systemctl enable docker
+
+# Apply group changes
+newgrp docker
+Install kubectl
+# Download kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+# Make kubectl executable
+chmod +x kubectl
+
+# Move kubectl to PATH
+sudo mv kubectl /usr/local/bin/
+
+# Verify installation
+kubectl version --client
+Install kind (Kubernetes in Docker)
+# Download kind
+curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+
+# Make kind executable
+chmod +x ./kind
+
+# Move kind to PATH
+sudo mv ./kind /usr/local/bin/kind
+
+# Verify installation
+kind version
+Install Git
+# Install Git
+sudo apt install -y git
+
+# Verify installation
+git --version
+Subtask 1.2: Create Kubernetes Cluster
+Create a local Kubernetes cluster using kind.
+
+# Create kind cluster configuration
+cat << EOF > kind-config.yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    nodeRegistration:
+      kubeletExtraArgs:
+        node-labels: "ingress-ready=true"
+  extraPortMappings:
+  - containerPort: 80
+    hostPort: 80
+    protocol: TCP
+  - containerPort: 443
+    hostPort: 443
+    protocol: TCP
+EOF
+
+# Create the cluster
+kind create cluster --config=kind-config.yaml --name=argocd-lab
+
+# Verify cluster is running
+kubectl cluster-info --context kind-argocd-lab
+
+# Check nodes
+kubectl get nodes
+Subtask 1.3: Install Kustomize
+Kustomize is now built into kubectl, but we'll also install the standalone version for additional features.
+
+# Download Kustomize
+curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+
+# Move to PATH
+sudo mv kustomize /usr/local/bin/
+
+# Verify installation
+kustomize version
+
+# Also verify kubectl kustomize
+kubectl kustomize --help
+Subtask 1.4: Create Sample Application Structure
+Create a directory structure for our sample application with Kustomize.
+
+# Create project directory
+mkdir -p ~/argocd-kustomize-lab
+cd ~/argocd-kustomize-lab
+
+# Create base application structure
+mkdir -p base
+mkdir -p overlays/development
+mkdir -p overlays/production
+
+# Create base deployment
+cat << EOF > base/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+  labels:
+    app: sample-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sample-app
+  template:
+    metadata:
+      labels:
+        app: sample-app
+    spec:
+      containers:
+      - name: sample-app
+        image: nginx:1.21
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "250m"
+          limits:
+            memory: "128Mi"
+            cpu: "500m"
+EOF
+
+# Create base service
+cat << EOF > base/service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: sample-app-service
+  labels:
+    app: sample-app
+spec:
+  selector:
+    app: sample-app
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+  type: ClusterIP
+EOF
+
+# Create base kustomization
+cat << EOF > base/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- deployment.yaml
+- service.yaml
+
+commonLabels:
+  environment: base
+  managed-by: kustomize
+EOF
+Subtask 1.5: Create Development Overlay
+# Create development overlay
+cat << EOF > overlays/development/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: development
+
+resources:
+- ../../base
+
+commonLabels:
+  environment: development
+
+patchesStrategicMerge:
+- deployment-patch.yaml
+
+images:
+- name: nginx
+  newTag: "1.21-alpine"
+EOF
+
+# Create development deployment patch
+cat << EOF > overlays/development/deployment-patch.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+spec:
+  replicas: 1
+  template:
+    spec:
+      containers:
+      - name: sample-app
+        resources:
+          requests:
+            memory: "32Mi"
+            cpu: "100m"
+          limits:
+            memory: "64Mi"
+            cpu: "200m"
+EOF
+
+# Create development namespace
+cat << EOF > overlays/development/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: development
+EOF
+
+# Update development kustomization to include namespace
+cat << EOF > overlays/development/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: development
+
+resources:
+- ../../base
+- namespace.yaml
+
+commonLabels:
+  environment: development
+
+patchesStrategicMerge:
+- deployment-patch.yaml
+
+images:
+- name: nginx
+  newTag: "1.21-alpine"
+EOF
+Subtask 1.6: Create Production Overlay
+# Create production overlay
+cat << EOF > overlays/production/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: production
+
+resources:
+- ../../base
+- namespace.yaml
+
+commonLabels:
+  environment: production
+
+patchesStrategicMerge:
+- deployment-patch.yaml
+
+images:
+- name: nginx
+  newTag: "1.21"
+EOF
+
+# Create production deployment patch
+cat << EOF > overlays/production/deployment-patch.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+spec:
+  replicas: 3
+  template:
+    spec:
+      containers:
+      - name: sample-app
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "500m"
+          limits:
+            memory: "256Mi"
+            cpu: "1000m"
+EOF
+
+# Create production namespace
+cat << EOF > overlays/production/namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+EOF
+Subtask 1.7: Test Kustomize Configuration
+# Test development overlay
+echo "=== Development Configuration ==="
+kubectl kustomize overlays/development
+
+echo -e "\n=== Production Configuration ==="
+kubectl kustomize overlays/production
+
+# Apply development configuration to test
+kubectl apply -k overlays/development
+
+# Verify deployment
+kubectl get all -n development
+
+# Clean up test deployment
+kubectl delete -k overlays/development
+Task 2: Create and Deploy a Custom Application with Kustomize using Argo CD
+Subtask 2.1: Install Argo CD
+# Create Argo CD namespace
+kubectl create namespace argocd
+
+# Install Argo CD
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Wait for Argo CD to be ready
+echo "Waiting for Argo CD to be ready..."
+kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
+
+# Verify Argo CD installation
+kubectl get all -n argocd
+Subtask 2.2: Install Argo CD CLI
+# Download Argo CD CLI
+curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+
+# Make it executable
+chmod +x argocd-linux-amd64
+
+# Move to PATH
+sudo mv argocd-linux-amd64 /usr/local/bin/argocd
+
+# Verify installation
+argocd version --client
+Subtask 2.3: Access Argo CD UI
+# Port forward to access Argo CD UI
+kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+
+# Get initial admin password
+ARGOCD_PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+echo "Argo CD Admin Password: $ARGOCD_PASSWORD"
+
+# Login to Argo CD CLI (in a new terminal or after stopping port-forward)
+# First, stop the background port-forward if needed
+# pkill -f "kubectl port-forward svc/argocd-server"
+
+# Start port-forward again for CLI login
+kubectl port-forward svc/argocd-server -n argocd 8080:443 > /dev/null 2>&1 &
+sleep 5
+
+# Login via CLI
+argocd login localhost:8080 --username admin --password $ARGOCD_PASSWORD --insecure
+
+echo "Argo CD is accessible at: https://localhost:8080"
+echo "Username: admin"
+echo "Password: $ARGOCD_PASSWORD"
+Subtask 2.4: Initialize Git Repository
+# Initialize git repository for our application
+cd ~/argocd-kustomize-lab
+git init
+
+# Configure git (replace with your information)
+git config user.name "Lab User"
+git config user.email "labuser@example.com"
+
+# Add all files
+git add .
+
+# Initial commit
+git commit -m "Initial commit: Kustomize application structure"
+
+# Create a bare repository to simulate remote repo
+cd ~
+git init --bare argocd-kustomize-repo.git
+
+# Add remote to our working directory
+cd ~/argocd-kustomize-lab
+git remote add origin ~/argocd-kustomize-repo.git
+
+# Push to our "remote" repository
+git push -u origin master
+Subtask 2.5: Create Argo CD Application for Development
+# Create development application
+cat << EOF > dev-application.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sample-app-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: file:///home/$(whoami)/argocd-kustomize-repo.git
+    targetRevision: HEAD
+    path: overlays/development
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: development
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+EOF
+
+# Apply the application
+kubectl apply -f dev-application.yaml
+
+# Verify application creation
+argocd app list
+Subtask 2.6: Create Argo CD Application for Production
+# Create production application
+cat << EOF > prod-application.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: sample-app-prod
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: file:///home/$(whoami)/argocd-kustomize-repo.git
+    targetRevision: HEAD
+    path: overlays/production
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: production
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+    - CreateNamespace=true
+EOF
+
+# Apply the application
+kubectl apply -f prod-application.yaml
+
+# List all applications
+argocd app list
+Subtask 2.7: Monitor Application Deployment
+# Check application status
+argocd app get sample-app-dev
+argocd app get sample-app-prod
+
+# Sync applications if needed
+argocd app sync sample-app-dev
+argocd app sync sample-app-prod
+
+# Wait for applications to be healthy
+echo "Waiting for applications to be healthy..."
+argocd app wait sample-app-dev --health
+argocd app wait sample-app-prod --health
+
+# Verify deployments in Kubernetes
+echo "=== Development Environment ==="
+kubectl get all -n development
+
+echo -e "\n=== Production Environment ==="
+kubectl get all -n production
+Subtask 2.8: Test GitOps Workflow
+# Make a change to the base application
+cd ~/argocd-kustomize-lab
+
+# Update the nginx image version in base
+sed -i 's/nginx:1.21/nginx:1.22/g' base/deployment.yaml
+
+# Commit and push changes
+git add .
+git commit -m "Update nginx to version 1.22"
+git push origin master
+
+# Refresh applications to detect changes
+argocd app refresh sample-app-dev
+argocd app refresh sample-app-prod
+
+# Check application status
+argocd app get sample-app-dev
+argocd app get sample-app-prod
+
+# Applications should automatically sync due to automated sync policy
+# Wait for sync to complete
+sleep 30
+
+# Verify the changes were applied
+kubectl describe deployment sample-app -n development | grep Image
+kubectl describe deployment sample-app -n production | grep Image
+Subtask 2.9: Create Custom Kustomize Components
+# Create a configmap component
+mkdir -p components/configmap
+
+cat << EOF > components/configmap/configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  app.properties: |
+    app.name=sample-app
+    app.version=1.0.0
+    log.level=INFO
+EOF
+
+cat << EOF > components/configmap/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+- configmap.yaml
+EOF
+
+# Update base to include the component
+cat << EOF > base/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+- deployment.yaml
+- service.yaml
+
+components:
+- ../components/configmap
+
+commonLabels:
+  environment: base
+  managed-by: kustomize
+EOF
+
+# Update deployment to use configmap
+cat << EOF > base/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+  labels:
+    app: sample-app
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: sample-app
+  template:
+    metadata:
+      labels:
+        app: sample-app
+    spec:
+      containers:
+      - name: sample-app
+        image: nginx:1.22
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "250m"
+          limits:
+            memory: "128Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/config
+      volumes:
+      - name: config-volume
+        configMap:
+          name: app-config
+EOF
+
+# Test the updated configuration
+kubectl kustomize overlays/development
+
+# Commit and push changes
+git add .
+git commit -m "Add configmap component"
+git push origin master
+
+# Refresh and sync applications
+argocd app refresh sample-app-dev
+argocd app refresh sample-app-prod
+
+# Wait for sync
+sleep 30
+
+# Verify configmap was created
+kubectl get configmap -n development
+kubectl get configmap -n production
+Subtask 2.10: Implement Environment-Specific Configurations
+# Create environment-specific configmap patches
+cat << EOF > overlays/development/configmap-patch.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  app.properties: |
+    app.name=sample-app
+    app.version=1.0.0-dev
+    log.level=DEBUG
+    environment=development
+EOF
+
+cat << EOF > overlays/production/configmap-patch.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-config
+data:
+  app.properties: |
+    app.name=sample-app
+    app.version=1.0.0
+    log.level=WARN
+    environment=production
+EOF
+
+# Update development kustomization
+cat << EOF > overlays/development/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: development
+
+resources:
+- ../../base
+- namespace.yaml
+
+commonLabels:
+  environment: development
+
+patchesStrategicMerge:
+- deployment-patch.yaml
+- configmap-patch.yaml
+
+images:
+- name: nginx
+  newTag: "1.22-alpine"
+EOF
+
+# Update production kustomization
+cat << EOF > overlays/production/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: production
+
+resources:
+- ../../base
+- namespace.yaml
+
+commonLabels:
+  environment: production
+
+patchesStrategicMerge:
+- deployment-patch.yaml
+- configmap-patch.yaml
+
+images:
+- name: nginx
+  newTag: "1.22"
+EOF
+
+# Commit and push changes
+git add .
+git commit -m "Add environment-specific configmap configurations"
+git push origin master
+
+# Refresh applications
+argocd app refresh sample-app-dev
+argocd app refresh sample-app-prod
+
+# Wait for sync
+sleep 30
+
+# Verify environment-specific configurations
+echo "=== Development ConfigMap ==="
+kubectl get configmap app-config -n development -o yaml
+
+echo -e "\n=== Production ConfigMap ==="
+kubectl get configmap app-config -n production -o yaml
+Verification and Testing
+Verify Complete Setup
+# Check all Argo CD applications
+argocd app list
+
+# Verify application health
+argocd app get sample-app-dev --show-params
+argocd app get sample-app-prod --show-params
+
+# Check Kubernetes resources
+echo "=== All Namespaces ==="
+kubectl get namespaces
+
+echo -e "\n=== Development Resources ==="
+kubectl get all,configmap -n development
+
+echo -e "\n=== Production Resources ==="
+kubectl get all,configmap -n production
+
+# Test application accessibility
+kubectl port-forward svc/sample-app-service -n development 8081:80 &
+DEV_PID=$!
+sleep 2
+curl -s http://localhost:8081 | head -5
+kill $DEV_PID
+
+kubectl port-forward svc/sample-app-service -n production 8082:80 &
+PROD_PID=$!
+sleep 2
+curl -s http://localhost:8082 | head -5
+kill $PROD_PID
+Test GitOps Workflow
+# Make another change to test the complete workflow
+cd ~/argocd-kustomize-lab
+
+# Update replica count in production
+sed -i 's/replicas: 3/replicas: 5/g' overlays/production/deployment-patch.yaml
+
+# Commit and push
+git add .
+git commit -m "Scale production to 5 replicas"
+git push origin master
+
+# Monitor the change
+echo "Monitoring production deployment scaling..."
+argocd app refresh sample-app-prod
+
+# Watch the deployment scale
+kubectl get deployment sample-app -n production -w &
+WATCH_PID=$!
+
+# Wait for sync
+sleep 45
+
+# Stop watching
+kill $WATCH_PID
+
+# Verify final state
+kubectl get deployment sample-app -n production
+Troubleshooting Common Issues
+Issue 1: Argo CD Applications Not Syncing
+# Check application status
+argocd app get sample-app-dev
+
+# Manual sync if needed
+argocd app sync sample-app-dev --force
+
+# Check for sync errors
+kubectl describe application sample-app-dev -n argocd
+Issue 2: Kustomize Build Errors
+# Test kustomize build locally
+kubectl kustomize overlays/development
+
+# Check for syntax errors in YAML files
+find . -name "*.yaml" -exec yamllint {} \;
+Issue 3: Resource Creation Issues
+# Check namespace creation
+kubectl get namespaces
+
+# Verify RBAC permissions
+kubectl auth can-i create deployments --namespace=development
+kubectl auth can-i create configmaps --namespace=production
+Cleanup
+# Delete Argo CD applications
+kubectl delete application sample-app-dev -n argocd
+kubectl delete application sample-app-prod -n argocd
+
+# Delete namespaces
+kubectl delete namespace development
+kubectl delete namespace production
+
+# Delete Argo CD
+kubectl delete namespace argocd
+
+# Delete kind cluster
+kind delete cluster --name=argocd-lab
+
+# Clean up local files
+cd ~
+rm -rf argocd-kustomize-lab
+rm -rf argocd-kustomize-repo.git
+Conclusion
+In this comprehensive lab, you have successfully:
+
+Set up a complete GitOps environment using Argo CD and Kustomize on a local Kubernetes cluster
+Mastered Kustomize fundamentals by creating base configurations and environment-specific overlays
+Implemented GitOps workflows that automatically deploy changes from Git repositories
+Created reusable components using Kustomize components for shared configurations
+Configured environment-specific deployments with different resource requirements and configurations
+Tested automated synchronization between Git changes and Kubernetes deployments
+This lab demonstrates the power of combining Argo CD with Kustomize for modern Kubernetes application deployment. The GitOps approach ensures that your cluster state always matches your Git repository, providing better security, auditability, and reliability. Kustomize enables you to manage complex configurations across multiple environments without duplicating YAML files.
+
+These skills are essential for modern DevOps practices and will help you implement robust, scalable deployment pipelines in production environments. The combination of Argo CD and Kustomize provides a solid foundation for managing Kubernetes applications at scale while maintaining consistency and reducing configuration drift.
